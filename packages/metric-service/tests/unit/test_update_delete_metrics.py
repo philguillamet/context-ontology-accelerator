@@ -12,7 +12,11 @@ import pytest
 from coa_metrics.api.delete_metric import handler as delete_handler
 from coa_metrics.api.update_metric import handler as update_handler
 from coa_metrics.neptune_client import MetricDefinition, MetricDialect
-from coa_metrics.source_status import PERMISSIVE_ENV, SourceValidationUnavailableError
+from coa_metrics.source_status import (
+    DATA_SOURCE_ID_FORMAT_MESSAGE,
+    PERMISSIVE_ENV,
+    SourceValidationUnavailableError,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -73,7 +77,63 @@ def _existing_metric() -> MetricDefinition:
 # ── Update tests ────────────────────────────────────────────────────────
 
 
+class TestUpdateDataSourceIdFormat:
+    @pytest.mark.parametrize("data_source_id", ["<script>alert(1)</script>", "ds 1", "x" * 129])
+    @patch("coa_metrics.api.update_metric._get_neptune")
+    def test_malformed_data_source_id_returns_400(self, mock_neptune: MagicMock, data_source_id: str) -> None:
+        mock_neptune.return_value.get_metric.return_value = _existing_metric()
+        body = {**_valid_update_body(), "dataSourceId": data_source_id}
+        resp = update_handler(_make_update_event(body=body), None)
+        assert resp["statusCode"] == 400
+        if len(data_source_id) <= 128:
+            assert json.loads(resp["body"])["message"] == DATA_SOURCE_ID_FORMAT_MESSAGE
+        mock_neptune.return_value.update_metric.assert_not_called()
+
+
 class TestUpdateMetric:
+    @patch("coa_metrics.api.update_metric._validate_soft")
+    @patch("coa_metrics.api.update_metric.check_source_table_exists")
+    @patch("coa_metrics.api.update_metric.check_source_approved")
+    @patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup")
+    @patch("coa_metrics.api.update_metric._get_eventbridge")
+    @patch("coa_metrics.api.update_metric._get_opensearch")
+    @patch("coa_metrics.api.update_metric._get_neptune")
+    def test_update_reuses_one_catalog_lookup_for_hard_and_soft_validation(
+        self,
+        mock_neptune: MagicMock,
+        mock_opensearch: MagicMock,
+        mock_eventbridge: MagicMock,
+        mock_build_lookup: MagicMock,
+        mock_source_approved: MagicMock,
+        mock_table_exists: MagicMock,
+        mock_validate_soft: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
+        lookup = MagicMock(name="shared_catalog_lookup")
+        mock_build_lookup.return_value = lookup
+        mock_source_approved.return_value = None
+        mock_table_exists.return_value = None
+        mock_validate_soft.return_value = []
+        mock_neptune.return_value.get_metric.return_value = _existing_metric()
+        mock_eventbridge.return_value.put_events.return_value = {}
+
+        response = update_handler(_make_update_event(body=_valid_update_body()), None)
+
+        assert response["statusCode"] == 200
+        mock_build_lookup.assert_called_once_with("test-ns")
+        mock_table_exists.assert_called_once_with(
+            "test-ns",
+            "ds-abc123",
+            "orders",
+            data_source_lookup=lookup,
+        )
+        mock_validate_soft.assert_called_once()
+        soft_call = mock_validate_soft.call_args
+        assert soft_call.args[0].source_table == "orders"
+        assert soft_call.args[1] == "test-ns"
+        assert soft_call.kwargs == {"data_source_lookup": lookup}
+
     @patch("coa_metrics.api.update_metric._get_eventbridge")
     @patch("coa_metrics.api.update_metric._get_opensearch")
     @patch("coa_metrics.api.update_metric._get_neptune")

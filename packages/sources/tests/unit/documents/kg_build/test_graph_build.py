@@ -9,16 +9,16 @@ Toolkit) so they run without any AWS infrastructure.
 
 from __future__ import annotations
 
+import importlib
 import json
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.constants import RESOURCE_PREFIX
 
 pytestmark = pytest.mark.unit
-
-import types
 
 from botocore.exceptions import ClientError
 from coa_control_plane_server.models.source_status import SourceStatus
@@ -39,6 +39,8 @@ def _stub_missing_modules() -> None:
         "llama_index.core.base.embeddings",
         "llama_index.core.base.embeddings.base",
         "llama_index.core.node_parser",
+        "llama_index.llms",
+        "llama_index.llms.bedrock_converse",
         "graphrag_toolkit",
         "graphrag_toolkit.lexical_graph",
         "graphrag_toolkit.lexical_graph.storage",
@@ -46,9 +48,16 @@ def _stub_missing_modules() -> None:
         "graphrag_toolkit.lexical_graph.indexing.build",
         "graphrag_toolkit.lexical_graph.indexing.extract",
         "graphrag_toolkit.lexical_graph.indexing.load",
+        "graphrag_toolkit.lexical_graph.utils",
+        "graphrag_toolkit.lexical_graph.utils.llm_cache",
         "graphrag_toolkit.lexical_graph.versioning",
     ]:
-        sys.modules.setdefault(dotted, types.ModuleType(dotted))
+        try:
+            importlib.import_module(dotted)
+        except ImportError:
+            module = types.ModuleType(dotted)
+            module.__coa_test_stub__ = True
+            sys.modules.setdefault(dotted, module)
 
     # make_llama_index_embedding (via coa_common) subclasses
     # BaseEmbedding at call time — provide a minimal stand-in so _setup_graphrag
@@ -100,6 +109,26 @@ def _stub_missing_modules() -> None:
     np = sys.modules["llama_index.core.node_parser"]
     if not hasattr(np, "SentenceSplitter"):
         np.SentenceSplitter = MagicMock()
+    # llm_cache's module constants are what the ProcessPool workers' Bedrock client is
+    # built from, so the patch rebinds them. Seed the toolkit's real defaults here —
+    # monkeypatch.setattr needs the attributes to exist, and a test that asserts the
+    # patch moved them off 60.0/2 is only meaningful if it starts there.
+    lcm = sys.modules["graphrag_toolkit.lexical_graph.utils.llm_cache"]
+    if not hasattr(lcm, "TIMEOUT"):
+        lcm.TIMEOUT = 60.0
+        lcm.MAX_ATTEMPTS = 2
+
+    # The extraction LLM is constructed as an instance so it can carry a timeout,
+    # which the toolkit's JSON config form silently drops. A stand-in that just
+    # records its kwargs lets the tests assert on what was passed.
+    bc = sys.modules["llama_index.llms.bedrock_converse"]
+    if not hasattr(bc, "BedrockConverse"):
+
+        class _StubBedrockConverse:
+            def __init__(self, **kwargs) -> None:
+                self.kwargs = kwargs
+
+        bc.BedrockConverse = _StubBedrockConverse
 
 
 _stub_missing_modules()
@@ -123,6 +152,7 @@ _BASE_ENV = {
     "ENABLE_PROPOSITION_EXTRACTION": "true",  # passed via container override
     "ENABLE_VERSIONING": "false",  # disable for most tests to avoid mocking add_versioning_info
     "DELETE_PREV_VERSIONS": "false",  # passed via container override
+    "NAMESPACE_LANGUAGE": "en",  # namespace-language snapshot from the job input
 }
 
 
@@ -203,6 +233,29 @@ def _mock_ddb_access():
     return ddb
 
 
+def _llm_kwargs(llm) -> dict:
+    """The constructor arguments the extraction LLM was built with.
+
+    Two shapes are possible depending on what is installed. With
+    llama_index.llms.bedrock_converse stubbed (this module's default) the stand-in
+    records its kwargs. When the real package is importable — which happens as soon as
+    another test module in the same session imports it, since sys.modules is shared —
+    graph_build builds a real _PicklableBedrockConverse instead, and the same values
+    have to be read off the pydantic model. Reading the stub's dict only made these
+    tests pass or fail on collection order.
+    """
+    if hasattr(llm, "kwargs"):
+        return llm.kwargs
+    return {
+        "model": llm.model,
+        "max_tokens": llm.max_tokens,
+        "timeout": llm.timeout,
+        "max_retries": llm.max_retries,
+        "region_name": llm.region_name,
+        "botocore_config": llm.botocore_config,
+    }
+
+
 def _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls):
     mock_gs, mock_vs = MagicMock(), MagicMock()
     mock_gsf.for_graph_store.return_value.__enter__ = MagicMock(return_value=mock_gs)
@@ -220,6 +273,40 @@ def _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls):
 
 
 class TestEnvValidation:
+    @pytest.mark.parametrize(
+        ("name", "raw", "message"),
+        [
+            ("EXTRACTION_TIMEOUT_SECONDS", "not-a-number", "must be a number"),
+            ("EXTRACTION_TIMEOUT_SECONDS", "nan", "must be finite"),
+            ("EXTRACTION_TIMEOUT_SECONDS", "3601", "must be finite"),
+            ("EXTRACTION_CONNECT_TIMEOUT_SECONDS", "0", "must be finite"),
+            ("EXTRACTION_MAX_ATTEMPTS", "0", "must be in"),
+            ("EXTRACTION_MAX_ATTEMPTS", "many", "must be an integer"),
+            ("EXTRACTION_NUM_THREADS_PER_WORKER", "257", "must be in"),
+            ("EXTRACTION_NUM_THREADS_PER_WORKER", "4.5", "must be an integer"),
+        ],
+    )
+    def test_extraction_client_env_rejects_malformed_or_unsafe_values(
+        self, monkeypatch, mod_factory, name, raw, message
+    ):
+        monkeypatch.setenv(name, raw)
+
+        with pytest.raises(ValueError, match=message):
+            mod_factory()
+
+    def test_extraction_client_env_accepts_documented_bounds(self, monkeypatch, mod_factory):
+        monkeypatch.setenv("EXTRACTION_TIMEOUT_SECONDS", "3600")
+        monkeypatch.setenv("EXTRACTION_CONNECT_TIMEOUT_SECONDS", "0.1")
+        monkeypatch.setenv("EXTRACTION_MAX_ATTEMPTS", "20")
+        monkeypatch.setenv("EXTRACTION_NUM_THREADS_PER_WORKER", "256")
+
+        configured = mod_factory()
+
+        assert configured.EXTRACTION_TIMEOUT_SECONDS == 3600
+        assert configured.EXTRACTION_CONNECT_TIMEOUT_SECONDS == 0.1
+        assert configured.EXTRACTION_MAX_ATTEMPTS == 20
+        assert configured.EXTRACTION_NUM_THREADS_PER_WORKER == 256
+
     @pytest.mark.parametrize(
         "missing_var",
         [
@@ -805,21 +892,28 @@ class TestGraphRAGConfig:
     def test_extraction_llm_is_json_with_max_tokens(
         self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod
     ):
-        """extraction_llm must be a JSON config carrying max_tokens, not a bare ARN.
+        """extraction_llm must be an INSTANCE carrying max_tokens AND a timeout.
 
-        The toolkit's ``GraphRAGConfig.to_llm()`` hardcodes ``max_tokens=4096`` when
-        given a bare model string and only honours ``max_tokens`` from the JSON form.
-        At 4096 output tokens, extraction truncates mid-response on dense chunks and
-        that chunk's trailing entities/statements are silently lost.
+        Neither a bare ARN nor the JSON config form is enough. The toolkit's
+        ``GraphRAGConfig.to_llm()`` hardcodes ``max_tokens=4096`` for a bare string —
+        at which extraction truncates mid-response on dense chunks and that chunk's
+        trailing entities/statements are silently lost — and while the JSON form does
+        honour max_tokens, it reads only model/temperature/max_tokens/region_name/
+        profile_name and drops the timeout, leaving BedrockConverse's 60s default.
+        Under Sonnet 5 that default failed every retry of a 14-document run.
         """
         monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "arn:aws:bedrock:us-east-1:1:inference-profile/m")
         _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
 
         mod._setup_graphrag("tenant-x")
 
-        assigned = json.loads(_cfg.extraction_llm)
+        assigned = _llm_kwargs(_cfg.extraction_llm)
         assert assigned["model"] == "arn:aws:bedrock:us-east-1:1:inference-profile/m"
         assert assigned["max_tokens"] == 16384
+        assert assigned["timeout"] == 300.0
+        # Region cannot be inherited from a session: the instance is pickled to
+        # ProcessPool workers, which rebuild the client from these fields alone.
+        assert assigned["region_name"] == mod.AWS_REGION
 
     @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
     @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
@@ -834,7 +928,169 @@ class TestGraphRAGConfig:
 
         mod._setup_graphrag("tenant-x")
 
-        assert json.loads(_cfg.extraction_llm)["max_tokens"] == 8192
+        assert _llm_kwargs(_cfg.extraction_llm)["max_tokens"] == 8192
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_extraction_timeout_env_override(self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod):
+        """The timeout is tunable without a redeploy."""
+        monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "arn:aws:bedrock:us-east-1:1:inference-profile/m")
+        monkeypatch.setattr(mod, "EXTRACTION_TIMEOUT_SECONDS", 900.0)
+        _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
+
+        mod._setup_graphrag("tenant-x")
+
+        assert _llm_kwargs(_cfg.extraction_llm)["timeout"] == 900.0
+
+
+class TestExtractionClientConfig:
+    """The botocore Config the extraction client is built with."""
+
+    @staticmethod
+    def _config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, threads: int):
+        monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "arn:aws:bedrock:us-east-1:1:inference-profile/m")
+        monkeypatch.setattr(mod, "EXTRACTION_NUM_THREADS_PER_WORKER", threads)
+        _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
+        mod._setup_graphrag("tenant-x")
+        return _llm_kwargs(_cfg.extraction_llm)["botocore_config"]
+
+    @pytest.mark.parametrize("threads", [16, 32])
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_pool_is_never_smaller_than_the_per_process_fanout(
+        self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod, threads
+    ):
+        """Assert the invariant, not a literal: the pool tracks the fan-out.
+
+        botocore defaults to 10 connections while this task runs 16 async calls per
+        process, and urllib3's block=False means the excess neither queues nor warns —
+        so an undersized pool is invisible. Pinning the relationship rather than the
+        number keeps it correct if the fan-out is retuned.
+        """
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, threads)
+        assert cfg.max_pool_connections >= threads
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_pool_keeps_a_floor_below_the_fanout(self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod):
+        """A small fan-out must not shrink the pool below botocore's own default."""
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, 2)
+        assert cfg.max_pool_connections == 10
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_connect_timeout_is_not_the_read_timeout(
+        self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod
+    ):
+        """Collapsing the two makes an unreachable endpoint look like a slow model.
+
+        Both upstream paths set connect and read from one value; that is what made a
+        network fault indistinguishable from the model taking its time.
+        """
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, 16)
+        assert cfg.read_timeout == mod.EXTRACTION_TIMEOUT_SECONDS
+        assert cfg.connect_timeout < cfg.read_timeout
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_retries_are_explicit_and_bounded(self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod):
+        """Supplying a Config means an omitted retries block silently reverts to legacy.
+
+        botocore rewrites ``max_attempts: N`` to ``total_max_attempts: N + 1`` when a
+        real Config is constructed, and leaves the key alone when the class is stubbed —
+        so assert the mode and the effective bound rather than the literal dict.
+        """
+        cfg = self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, 16)
+        retries = cfg.retries
+        assert retries["mode"] == "standard", "an omitted mode falls back to botocore's legacy default"
+        attempts = retries.get("total_max_attempts", retries.get("max_attempts", 0) + 1)
+        assert attempts == mod.EXTRACTION_MAX_ATTEMPTS + 1
+        assert attempts < 10, "retrying a read timeout dozens of times is what burned 45 minutes"
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.build.Checkpoint")
+    @patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory")
+    @patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex")
+    @patch("graphrag_toolkit.lexical_graph.GraphRAGConfig")
+    def test_llama_index_retry_layer_takes_the_same_bound(
+        self, _cfg, mock_idx_cls, mock_gsf, mock_vsf, _ckpt, monkeypatch, mod
+    ):
+        """BedrockConverse retries throttling and 5xx itself, around botocore's retries.
+
+        The two layers multiply, so pinning only botocore's ``max_attempts`` would leave
+        the outer bound free to drift back to a large value unnoticed.
+        """
+        self._config_for(mod, _cfg, mock_gsf, mock_vsf, mock_idx_cls, monkeypatch, 16)
+        assert _llm_kwargs(_cfg.extraction_llm)["max_retries"] == mod.EXTRACTION_MAX_ATTEMPTS
+
+
+class TestLlmCacheClientPatch:
+    """The worker-side client config, which is the one extraction actually uses."""
+
+    def test_patch_overrides_the_toolkit_timeout_and_attempts(self, monkeypatch, mod):
+        """Asserting on our own BedrockConverse is not enough to know the timeout applies.
+
+        Pickling to a ProcessPool strips the LLM's client, and LLMCache.predict then
+        builds its own from llm_cache's module constants (TIMEOUT = 60.0,
+        MAX_ATTEMPTS = 2). A run configured for 300s died on ReadTimeoutError because
+        those two numbers, not ours, were in force. This asserts the constants the
+        worker reads, so a change that only reaches our object fails here.
+        """
+        import graphrag_toolkit.lexical_graph.utils.llm_cache as llm_cache
+
+        monkeypatch.setattr(llm_cache, "TIMEOUT", 60.0)
+        monkeypatch.setattr(llm_cache, "MAX_ATTEMPTS", 2)
+        monkeypatch.setattr(mod, "_graphrag_llm_client_patched", False)
+        monkeypatch.setattr(mod, "EXTRACTION_TIMEOUT_SECONDS", 300.0)
+        monkeypatch.setattr(mod, "EXTRACTION_MAX_ATTEMPTS", 5)
+
+        mod._patch_graphrag_llm_cache_client_config()
+
+        assert llm_cache.TIMEOUT == 300.0, "the toolkit default would still be 60s"
+        assert llm_cache.MAX_ATTEMPTS == 5
+
+    def test_patch_is_idempotent(self, monkeypatch, mod):
+        """_setup_graphrag can run more than once per process (separated mode)."""
+        import graphrag_toolkit.lexical_graph.utils.llm_cache as llm_cache
+
+        monkeypatch.setattr(mod, "_graphrag_llm_client_patched", False)
+        monkeypatch.setattr(mod, "EXTRACTION_TIMEOUT_SECONDS", 300.0)
+
+        mod._patch_graphrag_llm_cache_client_config()
+        monkeypatch.setattr(llm_cache, "TIMEOUT", 999.0)
+        mod._patch_graphrag_llm_cache_client_config()
+
+        assert llm_cache.TIMEOUT == 999.0, "second call should be a no-op, not a re-apply"
+
+    def test_setup_graphrag_applies_the_patch(self, monkeypatch, mod):
+        """The patch is useless if _setup_graphrag does not call it."""
+        called: list[bool] = []
+        monkeypatch.setattr(mod, "_patch_graphrag_llm_cache_client_config", lambda: called.append(True))
+        monkeypatch.setattr(mod, "BEDROCK_MODEL_ARN", "")
+        with (
+            patch("graphrag_toolkit.lexical_graph.GraphRAGConfig"),
+            patch("graphrag_toolkit.lexical_graph.LexicalGraphIndex"),
+            patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory"),
+            patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory"),
+        ):
+            mod._setup_graphrag("tenant-x")
+
+        assert called == [True]
 
 
 # ===================================================================
@@ -856,7 +1112,7 @@ class TestBuildIndexingConfig:
         """Under default flags an ExtractionConfig is still built, with
         preferred_entity_classifications=[] and infer_entity_classifications
         wired to an InferClassificationsConfig — i.e. no news vocabulary."""
-        config = mod._build_indexing_config("bucket", "ns", "ds")
+        config = mod._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
 
         assert config is not None
         mock_ec.assert_called_once()
@@ -882,7 +1138,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == []
         assert kwargs["infer_entity_classifications"] is False
@@ -899,7 +1155,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["enable_proposition_extraction"] is False
 
@@ -916,7 +1172,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_bc.assert_called_once()
         assert mock_bc.call_args[1]["role_arn"] == "arn:aws:iam::123:role/batch"
 
@@ -934,7 +1190,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        config = entrypoint._build_indexing_config("bucket", "ns", "ds")
+        config = entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         # New contract: still returns an IndexingConfig (with the vocabulary
         # fix); only BatchConfig is absent.
         assert config is not None
@@ -953,7 +1209,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == ["Policy", "Claim", "Loss Ratio"]
         assert kwargs["infer_entity_classifications"] is False
@@ -973,7 +1229,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == []
         assert kwargs["infer_entity_classifications"] is mock_icc.return_value
@@ -1024,7 +1280,7 @@ class TestBuildIndexingConfig:
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
         with caplog.at_level("WARNING"):
-            entrypoint._build_indexing_config("bucket", "ns", "ds")
+            entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         kwargs = mock_ec.call_args.kwargs
         assert kwargs["preferred_entity_classifications"] == []
         assert kwargs["infer_entity_classifications"] is False
@@ -1043,7 +1299,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_ss.assert_called_once_with(chunk_size=1024, chunk_overlap=50)
         assert "chunking" in mock_ic.call_args.kwargs
 
@@ -1064,7 +1320,7 @@ class TestBuildIndexingConfig:
             delattr(pkg, "graph_build")
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
-        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_ss.assert_called_once_with(chunk_size=100, chunk_overlap=99)
 
     @patch("llama_index.core.node_parser.SentenceSplitter")
@@ -1075,7 +1331,7 @@ class TestBuildIndexingConfig:
         """CHUNK_SIZE=0 (default) must not pass a chunking= kwarg — otherwise
         the toolkit's SentenceSplitter fallback (256/25) never runs. Regression
         guard: this is what preserves the SEC-10-Q baseline."""
-        mod._build_indexing_config("bucket", "ns", "ds")
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_ss.assert_not_called()
         assert "chunking" not in mock_ic.call_args.kwargs
 
@@ -1145,11 +1401,18 @@ class TestMainFlow:
         mock_index, _, _ = _setup_graphrag_mocks(mock_gsf, mock_vsf, mock_idx_cls)
         mock_index.extract_and_build.side_effect = RuntimeError("fail")
 
-        with patch("llama_index.core.Document") as MockDoc:
+        # The backend health check opens a real OpenSearch client, so stub it:
+        # the exit code under test must come from the failed extraction, not from
+        # a health check that fails because the test has no backend.
+        with (
+            patch.object(mod, "_check_backend_health", return_value=True),
+            patch("llama_index.core.Document") as MockDoc,
+        ):
             MockDoc.side_effect = lambda **kw: MagicMock(**kw)
             with pytest.raises(SystemExit) as exc_info:
                 mod.main()
             assert exc_info.value.code == 1
+        mock_index.extract_and_build.assert_called_once()
 
 
 # ===================================================================
@@ -1613,7 +1876,7 @@ class TestPreferredTopics:
             patch("graphrag_toolkit.lexical_graph.ExtractionConfig") as ec,
             patch("graphrag_toolkit.lexical_graph.IndexingConfig"),
         ):
-            m._build_indexing_config("bucket", "tenant-a", "ds-001")
+            m._build_indexing_config("bucket", "tenant-a", "ds-001", namespace_language="en")
         assert ec.call_args.kwargs["preferred_topics"] == ["Black Tie Gala"]
 
     def test_empty_list_still_passed_explicitly(self, mod):
@@ -1623,7 +1886,7 @@ class TestPreferredTopics:
             patch("graphrag_toolkit.lexical_graph.ExtractionConfig") as ec,
             patch("graphrag_toolkit.lexical_graph.IndexingConfig"),
         ):
-            mod._build_indexing_config("bucket", "tenant-a", "ds-001")
+            mod._build_indexing_config("bucket", "tenant-a", "ds-001", namespace_language="en")
         assert ec.call_args.kwargs["preferred_topics"] == []
 
 
@@ -1687,3 +1950,181 @@ class TestEnvStrListCap:
         monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", _json.dumps(at_cap))
         m = mod_factory()
         assert len(m.PREFERRED_ENTITY_CLASSIFICATIONS) == MAX_VOCABULARY_ENTRIES
+
+
+# ===================================================================
+# Namespace language — extraction prompt instruction (A1)
+# ===================================================================
+
+# Shaped like graphrag-toolkit 3.18.7's templates: instructions first, then the
+# document-derived blocks the model is told to read.
+_FAKE_PROPOSITIONS_PROMPT = (
+    "\nYou decompose text into propositions.\n\n# Response Format:\ntitle\nproposition\n\n"
+    "<sourceInformation>\n{source_info}\n</sourceInformation>\n\n<text>\n{text}\n</text>\n"
+)
+_FAKE_TOPICS_PROMPT = (
+    "\nYou organize propositions into topics.\n\nAdhere strictly to the provided instructions.\n   \n"
+    "<propositions>\n{text}\n</propositions>\n\n<preferredTopics>\n{preferred_topics}\n</preferredTopics>\n\n"
+    "<preferredEntityClassifications>\n{preferred_entity_classifications}\n</preferredEntityClassifications>\n"
+)
+_FAKE_CLASSIFICATIONS_PROMPT = (
+    "\nYou identify domain-specific entity types.\n\nGuidelines:\n1. Use clear, concise classification names\n\n"
+    "Sample text chunks:\n<chunks>\n{text_chunks}\n</chunks>\n\n"
+    "Existing classifications:\n<existing_classifications>\n{existing_classifications}\n</existing_classifications>\n"
+)
+
+
+@pytest.fixture()
+def fake_toolkit_prompts(monkeypatch):
+    prompts = types.ModuleType("graphrag_toolkit.lexical_graph.indexing.prompts")
+    prompts.EXTRACT_PROPOSITIONS_PROMPT = _FAKE_PROPOSITIONS_PROMPT
+    prompts.EXTRACT_TOPICS_PROMPT = _FAKE_TOPICS_PROMPT
+    prompts.DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT = _FAKE_CLASSIFICATIONS_PROMPT
+    monkeypatch.setitem(sys.modules, "graphrag_toolkit.lexical_graph.indexing.prompts", prompts)
+    monkeypatch.setattr(sys.modules["graphrag_toolkit.lexical_graph.indexing"], "prompts", prompts, raising=False)
+    return prompts
+
+
+class TestNamespaceLanguagePrompts:
+    @pytest.mark.parametrize("language", ["en", "en-US"])
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_english_namespace_passes_no_prompt_templates(self, _ic, mock_ec, _icc, language, mod):
+        # No template override means the toolkit uses its own prompts: byte for
+        # byte what an ingest on main sends.
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language=language)
+        kwargs = mock_ec.call_args.kwargs
+        assert "extract_propositions_prompt_template" not in kwargs
+        assert "extract_topics_prompt_template" not in kwargs
+
+    def test_english_namespace_does_not_import_toolkit_prompts(self, mod):
+        assert mod._namespace_language_prompts("en") == {}
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_japanese_namespace_instructs_both_extraction_prompts(self, _ic, mock_ec, _icc, mod, fake_toolkit_prompts):
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="ja")
+        kwargs = mock_ec.call_args.kwargs
+        for parameter in ("extract_propositions_prompt_template", "extract_topics_prompt_template"):
+            template = kwargs[parameter]
+            assert "# Output Language (REQUIRED)" in template
+            assert "Write your output in Japanese (BCP 47 tag `ja`)" in template
+            # Identifiers stay verbatim.
+            assert "Copy identifiers exactly as printed" in template
+
+    def test_instruction_overrides_the_toolkit_uppercase_relationship_rule(self, mod):
+        # EXTRACT_TOPICS_PROMPT asks for uppercase underscore relationship and
+        # attribute names with English examples (WORKS_FOR); a ja ingest then
+        # emitted BELONGS_TO, which became the object-property label BELONGS TO.
+        instruction = mod._extraction_language_instruction("ja")
+        assert "relationship or attribute names in uppercase with underscores" in instruction
+        assert "that rule sets the format, not the language" in instruction
+        assert "write each such name in the output language" in instruction
+        assert "Uppercase applies only to letters that have case" in instruction
+
+    def test_instruction_sits_before_document_content(self, mod, fake_toolkit_prompts):
+        overrides = mod._namespace_language_prompts("ja")
+
+        propositions = overrides["extract_propositions_prompt_template"]
+        assert propositions.index("# Output Language") < propositions.index("<sourceInformation>")
+        assert propositions.index("# Output Language") < propositions.index("{text}")
+        topics = overrides["extract_topics_prompt_template"]
+        assert topics.index("# Output Language") < topics.index("<propositions>")
+        assert topics.index("# Output Language") < topics.index("{text}")
+
+        # The toolkit's own text is kept intact around the insertion.
+        instruction = mod._extraction_language_instruction("ja")
+        assert propositions.replace(instruction, "") == _FAKE_PROPOSITIONS_PROMPT
+        assert topics.replace(instruction, "") == _FAKE_TOPICS_PROMPT
+
+    def test_rendered_template_keeps_only_toolkit_placeholders(self, mod, fake_toolkit_prompts):
+        # The toolkit renders with str.format: the instruction must add no braces.
+        overrides = mod._namespace_language_prompts("ja")
+        rendered = overrides["extract_propositions_prompt_template"].format(source_info="S", text="T")
+        assert "<text>\nT\n</text>" in rendered
+
+    def test_missing_anchor_fails_loudly(self, mod, fake_toolkit_prompts):
+        fake_toolkit_prompts.EXTRACT_TOPICS_PROMPT = "no document block here {text}"
+        with pytest.raises(RuntimeError, match="EXTRACT_TOPICS_PROMPT has no <propositions> block"):
+            mod._namespace_language_prompts("ja")
+
+    @pytest.mark.parametrize("language", ["en", "en-US"])
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_english_namespace_passes_no_inference_prompt(self, _ic, _ec, mock_icc, language, mod):
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language=language)
+        mock_icc.assert_called_once_with(replace_default_classifications=True)
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_japanese_namespace_instructs_classification_inference(
+        self, _ic, mock_ec, mock_icc, mod, fake_toolkit_prompts
+    ):
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="ja")
+
+        mock_icc.assert_called_once()
+        kwargs = mock_icc.call_args.kwargs
+        assert kwargs["replace_default_classifications"] is True
+        assert mock_ec.call_args.kwargs["infer_entity_classifications"] is mock_icc.return_value
+        template = kwargs["prompt_template"]
+        assert "Write your output in Japanese (BCP 47 tag `ja`)" in template
+        # Ahead of the sample chunks, after the toolkit's guidelines.
+        assert template.index("Guidelines:") < template.index("# Output Language")
+        assert template.index("# Output Language") < template.index("Sample text chunks:")
+        assert template.index("# Output Language") < template.index("{text_chunks}")
+        # Otherwise the toolkit prompt, unchanged.
+        instruction = mod._extraction_language_instruction("ja")
+        assert template.replace(instruction, "") == _FAKE_CLASSIFICATIONS_PROMPT
+        # The instruction adds no str.format placeholders.
+        rendered = template.format(text_chunks="C", existing_classifications="E")
+        assert "<chunks>\nC\n</chunks>" in rendered
+
+    def test_classification_inference_missing_anchor_fails_loudly(self, mod, fake_toolkit_prompts):
+        fake_toolkit_prompts.DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT = "no sample block here {text_chunks}"
+        with pytest.raises(RuntimeError, match="DOMAIN_ENTITY_CLASSIFICATIONS_PROMPT has no Sample text chunks: block"):
+            mod._classification_inference_prompts("ja")
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_explicit_classifications_skip_inference_prompt(
+        self, _ic, mock_ec, mock_icc, monkeypatch, mod, fake_toolkit_prompts
+    ):
+        monkeypatch.setattr(mod, "PREFERRED_ENTITY_CLASSIFICATIONS", ["Pump"])
+        mod._build_indexing_config("bucket", "ns", "ds", namespace_language="ja")
+        mock_icc.assert_not_called()
+        assert mock_ec.call_args.kwargs["infer_entity_classifications"] is False
+
+    @pytest.mark.parametrize("snapshot", [None, "", "not a tag"])
+    @patch("coa_common.s3.boto3")
+    @patch("coa_common.dao.dynamodb.boto3")
+    def test_missing_or_invalid_snapshot_fails_the_build(self, mock_ddb_boto, mock_s3, snapshot, monkeypatch, mod):
+        if snapshot is None:
+            monkeypatch.delenv("NAMESPACE_LANGUAGE")
+        else:
+            monkeypatch.setenv("NAMESPACE_LANGUAGE", snapshot)
+        mock_table = MagicMock()
+        mock_table.get_item.return_value = {"Item": {"status": "SCANNING"}}
+        mock_ddb_boto.resource.return_value.Table.return_value = mock_table
+
+        with pytest.raises(SystemExit):
+            mod.main()
+
+        # Fails before loading documents, and never reads the namespace table.
+        mock_s3.client.return_value.get_paginator.assert_not_called()
+        update_kwargs = mock_table.update_item.call_args.kwargs
+        assert SourceStatus.SCAN_FAILED in update_kwargs["ExpressionAttributeValues"].values()
+        tables_opened = [c.args[0] for c in mock_ddb_boto.resource.return_value.Table.call_args_list]
+        assert tables_opened == [_BASE_ENV["DOC_SOURCES_TABLE"]]
+
+
+@pytest.mark.unit
+def test_stage_failure_message_is_fixed_text_without_traceback(mod):
+    """errorMessage is returned to callers by GetSource; the traceback stays in the log."""
+    msg = mod._stage_failure_message("SCAN_FAILED_BUILD")
+    assert msg.startswith("SCAN_FAILED_BUILD: ")
+    assert "Traceback" not in msg and "File " not in msg

@@ -266,7 +266,7 @@ class TestDispatchBuildsValidGraphArn:
         )
         req = MagicMock()
         req.app.state.config = config
-        with patch("coa_ontology.inducer.routers.induce_unstructured.start_induction") as mock_unstr:
+        with patch("coa_ontology.inducer.routers.induce_unstructured.start_unstructured_job") as mock_unstr:
             mock_unstr.return_value = SimpleNamespace(job_id="j", status="pending")
             start_induction(body=body, request=req, namespace="550e8400-e29b-41d4-a716-446655440003")
             mock_unstr.assert_called_once()
@@ -283,8 +283,29 @@ class TestDispatchBuildsValidGraphArn:
         # endpoint inside _build_lexical_store.
         assert built.graph_arn == "neptune-db"
 
-    def test_explicit_na_arn_is_forwarded(self):
-        """An explicit Neptune Analytics ARN on the request is forwarded as-is."""
+    def test_explicit_na_arn_is_rejected_at_customer_dispatch(self):
+        """The customer-facing dispatch rejects an explicit NA source."""
+        from fastapi import HTTPException
+
         arn = "arn:aws:neptune-graph:us-east-1:123456789012:graph/g-abc123"
-        built = self._dispatch(body_graph_arn=arn, config={"neptune_endpoint": "ignored"})
-        assert built.graph_arn == arn
+        with pytest.raises(HTTPException) as raised:
+            self._dispatch(body_graph_arn=arn, config={"neptune_endpoint": "ignored"})
+
+        assert raised.value.status_code == 422
+        assert raised.value.detail == {
+            "code": "UNSUPPORTED_SOURCE",
+            "message": "The requested lexical graph source is not supported.",
+        }
+
+    def test_missing_neptune_endpoint_returns_structured_configuration_error(self):
+        """A missing server source uses the same structured error contract."""
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as raised:
+            self._dispatch(body_graph_arn=None, config={})
+
+        assert raised.value.status_code == 422
+        assert raised.value.detail == {
+            "code": "CONFIGURATION_ERROR",
+            "message": "The lexical graph source is not configured.",
+        }

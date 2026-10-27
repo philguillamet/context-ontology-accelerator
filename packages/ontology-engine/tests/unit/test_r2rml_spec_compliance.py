@@ -412,24 +412,88 @@ class TestSubjectMapPrimaryKeys:
         tmpl = _subject_template(g, ns.TriplesMap_Metrics)
         assert '{"metric (id)"}' in tmpl
 
-    def test_pk_column_with_embedded_quotes(self, strategy):
-        """Column name with double quotes gets them escaped (doubled) per SQL standard."""
+    def test_embedded_quote_column_is_skipped_without_breaking_table(self, strategy, caplog):
+        """Ontop cannot resolve SQL-doubled quotes in R2RML column references."""
         tables = [
             CatalogTable(
                 id="1",
                 name="weird",
                 fullyQualifiedName="db.weird",
-                columns=[CatalogColumn(name='col"name', dataType="INT")],
+                columns=[
+                    CatalogColumn(name='has"quote', dataType="INT"),
+                    CatalogColumn(name="normal_id", dataType="INT"),
+                    CatalogColumn(name="description", dataType="VARCHAR"),
+                ],
                 tableConstraints=[
-                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=['col"name']),
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["normal_id"]),
                 ],
             )
         ]
-        g = _build(strategy, tables)
+
+        with caplog.at_level("WARNING"):
+            g = _build(strategy, tables)
+
         ns = Namespace(PREFIX)
-        tmpl = _subject_template(g, ns.TriplesMap_Weird)
-        # Embedded quote is doubled for SQL delimited identifier
-        assert '{"col""name"}' in tmpl
+        template = _subject_template(g, ns.TriplesMap_Weird)
+        referenced_columns = [
+            str(value)
+            for predicate in (RR.template, RR.column, RR.child, RR.parent)
+            for value in g.objects(None, predicate)
+        ]
+        assert 'has""quote' not in "\n".join(referenced_columns)
+        assert template == f'{PREFIX}weird/{{"normal_id"}}'
+        assert (ns["TriplesMap_Weird/POM_HasQuote"], None, None) not in g
+        assert _object_map_column(g, ns["TriplesMap_Weird/POM_Description"]) == '"description"'
+
+        warning = next(record for record in caplog.records if record.message == "r2rml_column_skipped_embedded_quote")
+        assert warning.table == "weird"
+        assert warning.column == 'has"quote'
+
+    @pytest.mark.parametrize(
+        ("pk_columns", "unsupported"),
+        [
+            # Keeping only `tenant` would merge every order line of a tenant into
+            # one individual.
+            pytest.param(["tenant", 'line"no'], ['line"no'], id="composite-pk-one-unsupported-component"),
+            # Falling back to another column (`amount`) would mint one individual
+            # per amount value.
+            pytest.param(['line"no'], ['line"no'], id="single-unsupported-pk"),
+        ],
+    )
+    def test_table_with_unsupported_pk_column_is_skipped(self, strategy, caplog, pk_columns, unsupported):
+        """A subject template without the whole PK cannot identify a row, so no TriplesMap."""
+        tables = [
+            CatalogTable(
+                id="1",
+                name="order_lines",
+                fullyQualifiedName="db.order_lines",
+                columns=[
+                    CatalogColumn(name="tenant", dataType="INT"),
+                    CatalogColumn(name='line"no', dataType="INT"),
+                    CatalogColumn(name="amount", dataType="INT"),
+                ],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=pk_columns)],
+            ),
+            CatalogTable(
+                id="2",
+                name="tenants",
+                fullyQualifiedName="db.tenants",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+        ]
+
+        with caplog.at_level("WARNING"):
+            g = _build(strategy, tables)
+
+        ns = Namespace(PREFIX)
+        assert (ns.TriplesMap_OrderLines, None, None) not in g
+        assert set(g.subjects(RDF.type, RR.TriplesMap)) == {ns.TriplesMap_Tenants}
+        warning = next(
+            record for record in caplog.records if record.message == "r2rml_table_skipped_unsupported_primary_key"
+        )
+        assert warning.table == "order_lines"
+        assert warning.columns == unsupported
 
     def test_pk_preserves_column_order(self, strategy):
         """Composite PK template columns appear in constraint declaration order."""
@@ -494,6 +558,13 @@ class TestForeignKeyObjectMaps:
         """R2RML §7.5: FK ObjectMaps use rr:parentTriplesMap, NOT rr:column."""
         tables = [
             CatalogTable(
+                id="0",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
                 id="1",
                 name="orders",
                 fullyQualifiedName="db.orders",
@@ -505,7 +576,7 @@ class TestForeignKeyObjectMaps:
                         referredColumns=["customers.id"],
                     ),
                 ],
-            )
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -518,6 +589,13 @@ class TestForeignKeyObjectMaps:
         """R2RML §7.5: FK ObjectMaps use rr:parentTriplesMap, NOT rr:template."""
         tables = [
             CatalogTable(
+                id="0",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
                 id="1",
                 name="orders",
                 fullyQualifiedName="db.orders",
@@ -529,7 +607,7 @@ class TestForeignKeyObjectMaps:
                         referredColumns=["customers.id"],
                     ),
                 ],
-            )
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -542,6 +620,13 @@ class TestForeignKeyObjectMaps:
         """R2RML §7.5: Referencing Object Maps do not need explicit rr:termType."""
         tables = [
             CatalogTable(
+                id="0",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
                 id="1",
                 name="orders",
                 fullyQualifiedName="db.orders",
@@ -553,7 +638,7 @@ class TestForeignKeyObjectMaps:
                         referredColumns=["customers.id"],
                     ),
                 ],
-            )
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -566,28 +651,12 @@ class TestForeignKeyObjectMaps:
         """FK ObjectMaps MUST have rr:parentTriplesMap pointing to target TriplesMap."""
         tables = [
             CatalogTable(
-                id="1",
-                name="orders",
-                fullyQualifiedName="db.orders",
-                columns=[CatalogColumn(name="customer_id", dataType="INT")],
-                tableConstraints=[
-                    CatalogConstraint(
-                        constraintType="FOREIGN_KEY",
-                        columns=["customer_id"],
-                        referredColumns=["customers.id"],
-                    ),
-                ],
-            )
-        ]
-        g = _build(strategy, tables)
-        ns = Namespace(PREFIX)
-        parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
-        assert parent is not None
-        assert parent == ns.TriplesMap_Customers
-
-    def test_fk_object_map_has_join_condition(self, strategy):
-        """FK ObjectMaps MUST have rr:joinCondition with child/parent columns."""
-        tables = [
+                id="0",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
             CatalogTable(
                 id="1",
                 name="orders",
@@ -600,12 +669,99 @@ class TestForeignKeyObjectMaps:
                         referredColumns=["customers.id"],
                     ),
                 ],
-            )
+            ),
+        ]
+        g = _build(strategy, tables)
+        ns = Namespace(PREFIX)
+        parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
+        assert parent is not None
+        assert parent == ns.TriplesMap_Customers
+
+    def test_fk_object_map_has_join_condition(self, strategy):
+        """FK ObjectMaps MUST have rr:joinCondition with child/parent columns."""
+        tables = [
+            CatalogTable(
+                id="0",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="1",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[CatalogColumn(name="customer_id", dataType="INT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                    ),
+                ],
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
         conditions = _object_map_join_conditions(g, ns["TriplesMap_Orders/POM_CustomerId"])
         assert conditions == [('"customer_id"', '"id"')]
+
+    def test_quoted_parent_column_leaves_relationship_unmapped(self, strategy, caplog):
+        """Unsafe rr:parent text drops the join and maps no literal in its place.
+
+        The ontology declares ``children_parentId`` an owl:ObjectProperty, so a
+        literal under it is a MappingOntologyMismatchException at Ontop load.
+        """
+        tables = [
+            CatalogTable(
+                id="parent",
+                name="parents",
+                fullyQualifiedName="db.parents",
+                columns=[
+                    CatalogColumn(name='has"quote', dataType="INT"),
+                    CatalogColumn(name="safe_id", dataType="INT"),
+                ],
+                tableConstraints=[
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["safe_id"]),
+                ],
+            ),
+            CatalogTable(
+                id="child",
+                name="children",
+                fullyQualifiedName="db.children",
+                columns=[
+                    CatalogColumn(name="id", dataType="INT"),
+                    CatalogColumn(name="parent_id", dataType="INT"),
+                ],
+                tableConstraints=[
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"]),
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["parent_id"],
+                        referredColumns=['parents.has"quote'],
+                    ),
+                ],
+            ),
+        ]
+
+        with caplog.at_level("WARNING"):
+            g = _build(strategy, tables)
+
+        ns = Namespace(PREFIX)
+        assert (ns["TriplesMap_Children/POM_ParentId"], None, None) not in g
+        assert (None, RR.predicate, ns.children_parentId) not in g
+        assert any(
+            record.message == "r2rml_column_skipped_embedded_quote"
+            and record.table == "parents"
+            and record.column == 'has"quote'
+            for record in caplog.records
+        )
+        assert any(
+            record.message == "r2rml_relationship_left_unmapped"
+            and record.table == "children"
+            and record.column == "parent_id"
+            for record in caplog.records
+        )
 
     # ── 3.2 Simple FK → Simple PK (happy path) ──────────────────────────────
 
@@ -903,9 +1059,17 @@ class TestForeignKeyObjectMaps:
     # ── 3.6 FK target not in the same build call ─────────────────────────────
 
     def test_fk_target_not_included_in_tables_list(self, strategy):
-        """FK references a table not passed to build_r2rml. The FK ObjectMap is
-        still generated because referredColumns carries the target table name.
-        parentTriplesMap is synthesized as TriplesMap_{PascalCase(target)}."""
+        """FK references a table NOT minted this run. The join must DEGRADE
+        TO A LITERAL — not emit a dangling rr:parentTriplesMap to a TriplesMap
+        that is never declared.
+
+        Previously this synthesized ``parentTriplesMap = TriplesMap_{Pascal(target)}``,
+        a reference to a TriplesMap absent from the mapping. Ontop rejects the
+        WHOLE mapping on load when a parentTriplesMap has no matching TriplesMap,
+        so one FK to a rejected / dropped / not-yet-synced target failed every
+        query in the namespace permanently. The out-of-run FK now emits a plain
+        datatype ObjectMap (raw column value), exactly as an ambiguous target does.
+        """
         orders = CatalogTable(
             id="1",
             name="orders",
@@ -923,16 +1087,22 @@ class TestForeignKeyObjectMaps:
                 ),
             ],
         )
-        # customers table NOT included
+        # customers table NOT included — the target is out of this run.
         g = _build(strategy, [orders])
         ns = Namespace(PREFIX)
 
+        # No dangling join: the ObjectMap carries no parentTriplesMap.
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
-        # parentTriplesMap is still generated, referencing the expected TriplesMap URI
-        assert parent == ns.TriplesMap_Customers
+        assert parent is None, "out-of-run FK target must not emit a dangling rr:parentTriplesMap"
 
-        conditions = _object_map_join_conditions(g, ns["TriplesMap_Orders/POM_CustomerId"])
-        assert conditions == [('"customer_id"', '"id"')]
+        # The dangling TriplesMap IRI is nowhere in the graph.
+        assert (None, RR.parentTriplesMap, ns.TriplesMap_Customers) not in g
+        assert ns.TriplesMap_Customers not in set(g.objects(None, RR.parentTriplesMap))
+
+        # Degrades to a datatype literal: raw column value, no join.
+        col = _object_map_column(g, ns["TriplesMap_Orders/POM_CustomerId"])
+        assert col == '"customer_id"'
+        assert _object_map_datatype(g, ns["TriplesMap_Orders/POM_CustomerId"]) == XSD.integer
 
     # ── 3.7 referredColumns format variations ────────────────────────────────
 
@@ -951,7 +1121,14 @@ class TestForeignKeyObjectMaps:
                         referredColumns=["orders.order_id"],
                     ),
                 ],
-            )
+            ),
+            CatalogTable(
+                id="2",
+                name="orders",
+                fullyQualifiedName="billing.orders",
+                columns=[CatalogColumn(name="order_id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["order_id"])],
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -1013,7 +1190,15 @@ class TestForeignKeyObjectMaps:
                         referredColumns=["public.orders.order_id"],
                     ),
                 ],
-            )
+            ),
+            CatalogTable(
+                id="2",
+                name="orders",
+                fullyQualifiedName="public.orders",
+                sourceSchema="public",
+                columns=[CatalogColumn(name="order_id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["order_id"])],
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -2086,6 +2271,13 @@ class TestEdgeCases:
         referencing object map pointing to the target."""
         tables = [
             CatalogTable(
+                id="0",
+                name="users",
+                fullyQualifiedName="db.users",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
                 id="1",
                 name="user_profiles",
                 fullyQualifiedName="db.user_profiles",
@@ -2101,7 +2293,7 @@ class TestEdgeCases:
                         referredColumns=["users.id"],
                     ),
                 ],
-            )
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -2145,6 +2337,20 @@ class TestEdgeCases:
         """
         tables = [
             CatalogTable(
+                id="a",
+                name="table_a",
+                fullyQualifiedName="db.table_a",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="b",
+                name="table_b",
+                fullyQualifiedName="db.table_b",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
                 id="1",
                 name="refs",
                 fullyQualifiedName="db.refs",
@@ -2161,7 +2367,7 @@ class TestEdgeCases:
                         referredColumns=["table_b.id"],
                     ),
                 ],
-            )
+            ),
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
@@ -3009,7 +3215,28 @@ class TestOverlappingCompositeForeignKeys:
                 CatalogConstraint(constraintType="FOREIGN_KEY", columns=["c", "d"], referredColumns=["p3.c", "p3.d"]),
             ],
         )
-        g = _build(strategy, [child])
+        p1 = CatalogTable(
+            id="2",
+            name="p1",
+            fullyQualifiedName="s.p1",
+            columns=[CatalogColumn(name="a", dataType="INT"), CatalogColumn(name="b", dataType="INT")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["a", "b"])],
+        )
+        p2 = CatalogTable(
+            id="3",
+            name="p2",
+            fullyQualifiedName="s.p2",
+            columns=[CatalogColumn(name="b", dataType="INT"), CatalogColumn(name="c", dataType="INT")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["b", "c"])],
+        )
+        p3 = CatalogTable(
+            id="4",
+            name="p3",
+            fullyQualifiedName="s.p3",
+            columns=[CatalogColumn(name="c", dataType="INT"), CatalogColumn(name="d", dataType="INT")],
+            tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["c", "d"])],
+        )
+        g = _build(strategy, [child, p1, p2, p3])
 
         ns = Namespace(PREFIX)
         # a anchors FK1 (folding in b); b is skipped as folded, so c anchors FK2
@@ -3367,3 +3594,347 @@ class TestAmbiguousFkTargetDegradesToLiteral:
 
         assert ("order_id", ConstraintType.DATATYPE) in by_type
         assert ("order_id", ConstraintType.REFERENCE) not in by_type
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 15: An approved FK whose target is NOT minted this run degrades to a
+# literal across ALL FOUR artifacts
+#
+# The dangling-join defect: an APPROVED foreign key whose target table is absent
+# from the final minted table set — rejected at review, dropped by a later
+# filter, or missing after a partial re-sync — still emitted a join reference to a
+# TriplesMap / class / shape / template that is never declared. The dangling
+# rr:parentTriplesMap made Ontop reject the WHOLE mapping on load, so the VKG
+# health check failed permanently for the namespace.
+#
+# The four emitters gate only on the FK's OWN approval (fk_edge_allowed), never on
+# whether the join TARGET is minted this run. The fix keys the final "target not
+# resolvable" branch on "is the target in the run?" — cause-agnostic — and
+# degrades to a plain datatype literal, exactly as the ambiguous-target branch
+# already did. All four must degrade TOGETHER or the artifacts contradict.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestRejectedTargetDegradesAcrossArtifacts:
+    """An APPROVED FK to an out-of-run target degrades to a literal everywhere.
+
+    Non-vacuity: every assertion below fails on the pre-fix source (the four
+    emitters emitted a bare TriplesMap_<Target> / ind:<Target> reference) and
+    passes with the fix — verified by reverting the four source files to
+    origin/main, running this class red, then restoring the fix and running it
+    green.
+    """
+
+    PREFIX = PREFIX
+
+    @staticmethod
+    def _tables():
+        """``orders.customer_id`` is an APPROVED FK to ``customers`` — but only
+        ``orders`` is minted this run. ``customers`` was e.g. rejected at review or
+        dropped by a later filter, so it never reaches build_r2rml / the ontology /
+        the shapes. The FK itself passes ``fk_edge_allowed`` (APPROVED)."""
+        return [
+            CatalogTable(
+                id="orders",
+                name="orders",
+                fullyQualifiedName="store.orders",
+                sourceSchema="store",
+                columns=[
+                    CatalogColumn(name="id", dataType="INT"),
+                    CatalogColumn(name="customer_id", dataType="INT"),
+                ],
+                tableConstraints=[
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"]),
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                        relationshipType="AI_INFERRED",
+                        reviewStatus="APPROVED",
+                    ),
+                ],
+            )
+        ]
+
+    # ── Artifact 1: R2RML (base build_r2rml) ─────────────────────────────────
+
+    def test_r2rml_emits_no_dangling_parent_triples_map(self, strategy):
+        g = _build(strategy, self._tables())
+        ns = Namespace(self.PREFIX)
+
+        # No join at all — and specifically not to a non-existent TriplesMap.
+        assert _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"]) is None
+        assert set(g.objects(None, RR.parentTriplesMap)) == set()
+        assert ns.TriplesMap_Customers not in set(g.objects(None, RR.parentTriplesMap))
+
+    def test_r2rml_degrades_the_column_to_a_datatype_literal(self, strategy):
+        g = _build(strategy, self._tables())
+        ns = Namespace(self.PREFIX)
+
+        assert _object_map_column(g, ns["TriplesMap_Orders/POM_CustomerId"]) == '"customer_id"'
+        assert _object_map_datatype(g, ns["TriplesMap_Orders/POM_CustomerId"]) == XSD.integer
+
+    # ── Artifact 2: ontology rdfs:range (table_to_ontology) ──────────────────
+
+    def test_ontology_declares_a_datatype_property_not_an_object_property(self, strategy):
+        onto, _ = strategy._build_proposal_ontology(self.PREFIX, self._tables(), [])
+        ns = Namespace(self.PREFIX)
+        prop = ns["orders_customerId"]
+
+        assert (prop, RDF.type, OWL.DatatypeProperty) in onto
+        assert (prop, RDF.type, OWL.ObjectProperty) not in onto
+        assert (prop, RDFS.range, XSD.integer) in onto
+        # The out-of-run target's class is never declared.
+        assert (ns.Customers, RDF.type, OWL.Class) not in onto
+
+    # ── Artifact 3: SHACL shapes (validation.shapes.config) ──────────────────
+
+    def test_shapes_assert_a_datatype_constraint_not_a_reference(self, strategy):
+        from coa_ontology.validation.shapes.config import ConstraintType, generate_config_from_db
+
+        cfg = generate_config_from_db(self._tables(), uri_prefix=self.PREFIX)
+        by_type = {
+            (c.property_name, c.constraint_type)
+            for cls in cfg.classes
+            if cls.class_name == "orders"
+            for c in cls.constraints
+        }
+
+        assert ("customer_id", ConstraintType.DATATYPE) in by_type
+        assert ("customer_id", ConstraintType.REFERENCE) not in by_type
+
+    def test_compiled_shacl_asserts_no_sh_class_against_the_literal_column(self, strategy):
+        from coa_ontology.validation.shapes.config import compile_to_shacl, generate_config_from_db
+
+        shapes = Graph().parse(
+            data=compile_to_shacl(generate_config_from_db(self._tables(), uri_prefix=self.PREFIX), self.PREFIX),
+            format="turtle",
+        )
+        sh = Namespace("http://www.w3.org/ns/shacl#")
+
+        # No shape asserts sh:class pointing at the undeclared Customers class.
+        assert URIRef(f"{self.PREFIX}Customers") not in set(shapes.objects(None, sh["class"]))
+
+    # ── Artifact 4: RIGOR R2RML (rigor_ontology) ─────────────────────────────
+
+    def test_rigor_mapping_emits_a_literal_not_an_iri_template(self, strategy):
+        """RIGOR's writer emits an IRI template only for an object property whose
+        target resolves. Declare the FK an object property (as a RIGOR proposal
+        would) so this exercises the writer's OWN resolution — _fk_target_token —
+        not the ontology demotion the other artifacts share."""
+        from coa_ontology.inducer.strategies.rigor_ontology import RigorOntologyStrategy
+
+        tables = self._tables()
+        ontology, _ = strategy._build_proposal_ontology(self.PREFIX, tables, [])
+        ns = Namespace(self.PREFIX)
+        prop = ns["orders_customerId"]
+        ontology.remove((prop, RDF.type, OWL.DatatypeProperty))
+        ontology.remove((prop, RDFS.range, None))
+        ontology.add((prop, RDF.type, OWL.ObjectProperty))
+
+        mapping = RigorOntologyStrategy().build_r2rml(self.PREFIX, tables, {t.name for t in tables}, ontology)
+        object_map = URIRef(f"{self.PREFIX}TriplesMap_orders/POM_CustomerId/ObjectMap")
+
+        # No dangling IRI template to an out-of-run subject token; a literal column.
+        assert mapping.value(object_map, RR.template) is None
+        assert str(mapping.value(object_map, RR.column)) == '"customer_id"'
+
+    # ── All four agree, and the warning fires in each emitter ────────────────
+
+    def test_all_four_artifacts_degrade_consistently(self, strategy):
+        """The whole point: no artifact asserts a relationship the others drop."""
+        from coa_ontology.validation.shapes.config import ConstraintType, generate_config_from_db
+
+        tables = self._tables()
+        ns = Namespace(self.PREFIX)
+
+        r2rml = _build(strategy, tables)
+        onto, _ = strategy._build_proposal_ontology(self.PREFIX, tables, [])
+        cfg = generate_config_from_db(tables, uri_prefix=self.PREFIX)
+
+        # R2RML: literal, no join.
+        assert _object_map_parent_tmap(r2rml, ns["TriplesMap_Orders/POM_CustomerId"]) is None
+        # Ontology: datatype property.
+        assert (ns.orders_customerId, RDF.type, OWL.DatatypeProperty) in onto
+        assert (ns.orders_customerId, RDF.type, OWL.ObjectProperty) not in onto
+        # SHACL: datatype, no reference.
+        shacl_types = {
+            c.constraint_type
+            for cls in cfg.classes
+            if cls.class_name == "orders"
+            for c in cls.constraints
+            if c.property_name == "customer_id"
+        }
+        assert ConstraintType.DATATYPE in shacl_types
+        assert ConstraintType.REFERENCE not in shacl_types
+
+    def test_base_r2rml_logs_the_degrade_warning(self, strategy, caplog):
+        with caplog.at_level("WARNING", logger="coa_ontology.inducer.strategies.base"):
+            _build(strategy, self._tables())
+        assert any(r.getMessage() == "fk_target_out_of_run_degraded_to_literal" for r in caplog.records), (
+            "base._parent_tmap must warn when it degrades an out-of-run FK target"
+        )
+
+    def test_shacl_config_logs_the_degrade_warning(self, strategy, caplog):
+        from coa_ontology.validation.shapes.config import generate_config_from_db
+
+        with caplog.at_level("WARNING", logger="coa_ontology.validation.shapes.config"):
+            generate_config_from_db(self._tables(), uri_prefix=self.PREFIX)
+        assert any(r.getMessage() == "fk_target_out_of_run_degraded_to_literal" for r in caplog.records), (
+            "generate_config_from_db must warn when it degrades an out-of-run FK target"
+        )
+
+    def test_rigor_logs_the_degrade_warning(self, strategy, caplog):
+        """_fk_target_token warns for an out-of-run target via the shared key."""
+        from coa_ontology.inducer.strategies.base import ambiguous_target_names, reference_index, subject_template_names
+        from coa_ontology.inducer.strategies.rigor_ontology import RigorOntologyStrategy
+
+        tables = self._tables()
+        referrer = tables[0]
+        with caplog.at_level("WARNING", logger="coa_ontology.inducer.strategies.rigor_ontology"):
+            token = RigorOntologyStrategy._fk_target_token(
+                "customers",
+                referrer,
+                reference_index(tables),
+                subject_template_names(tables),
+                ambiguous_target_names(tables),
+                None,
+            )
+        assert token is None
+        assert any(r.getMessage() == "fk_target_out_of_run_degraded_to_literal" for r in caplog.records), (
+            "_fk_target_token must warn when it degrades an out-of-run FK target"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Unsupported (embedded-quote) columns: the mapping must still agree with the
+# ontology. Ontop loads the two together (`ontop endpoint --ontology --mapping`)
+# and rejects the whole namespace with MappingOntologyMismatchException when a
+# predicate the ontology declares an owl:ObjectProperty is mapped to a literal.
+# An object property with NO mapping is fine; a literal under it is not.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _table(name, columns, constraints=(), ds="1"):
+    return CatalogTable(
+        id=f"{ds}:{name}",
+        name=name,
+        fullyQualifiedName=f"db_{ds}.{name}",
+        datasourceId=ds,
+        columns=[CatalogColumn(name=c, dataType="INT") for c in columns],
+        tableConstraints=list(constraints),
+    )
+
+
+def _pk(columns):
+    return CatalogConstraint(constraintType="PRIMARY_KEY", columns=columns)
+
+
+def _fk(columns, referred, ds=None):
+    return CatalogConstraint(
+        constraintType="FOREIGN_KEY", columns=columns, referredColumns=referred, targetDatasourceId=ds
+    )
+
+
+def _mapping_ontology_mismatches(onto: Graph, r2rml: Graph) -> list[str]:
+    """What Ontop would reject: object properties mapped as literals, joins to absent TriplesMaps."""
+    object_props = set(onto.subjects(RDF.type, OWL.ObjectProperty))
+    emitted = set(r2rml.subjects(RDF.type, RR.TriplesMap))
+    problems = []
+    for pom, predicate in r2rml.subject_objects(RR.predicate):
+        om = r2rml.value(pom, RR.objectMap)
+        parent = r2rml.value(om, RR.parentTriplesMap)
+        if predicate in object_props and parent is None:
+            problems.append(f"object property mapped as literal: {predicate}")
+        if parent is not None and parent not in emitted:
+            problems.append(f"join to a TriplesMap that is not emitted: {parent}")
+    return sorted(problems)
+
+
+class TestUnsupportedColumnsKeepMappingAndOntologyInStep:
+    """Mapping checked against the ontology the same run produces."""
+
+    CASES = {
+        # Kun's reproduction: the only FK's parent column contains a quote.
+        "single-fk-quoted-parent-column": (
+            [
+                _table("parents", ['has"quote', "safe_id"], [_pk(["safe_id"])]),
+                _table("children", ["id", "parent_id"], [_pk(["id"]), _fk(["parent_id"], ['parents.has"quote'])]),
+            ],
+            "children_parentId",
+        ),
+        "composite-fk-quoted-parent-column": (
+            [
+                _table("parents", ["id", "a", 'b"q'], [_pk(["id"])]),
+                _table("children", ["id", "x", "y"], [_pk(["id"]), _fk(["x", "y"], ["parents.a", 'parents.b"q'])]),
+            ],
+            "children_x",
+        ),
+        "composite-fk-quoted-child-column": (
+            [
+                _table("parents", ["id", "a", "b"], [_pk(["id"])]),
+                _table("children", ["id", "x", 'y"q'], [_pk(["id"]), _fk(["x", 'y"q'], ["parents.a", "parents.b"])]),
+            ],
+            "children_x",
+        ),
+        # The parent column is fine, but the parent table has no TriplesMap
+        # because its PK has an unsupported component.
+        "fk-to-table-skipped-for-its-pk": (
+            [
+                _table("lines", ["tenant", 'line"no'], [_pk(["tenant", 'line"no'])]),
+                _table("notes", ["id", "tenant"], [_pk(["id"]), _fk(["tenant"], ["lines.tenant"])]),
+            ],
+            "notes_tenant",
+        ),
+        "fk-to-table-with-no-supported-column": (
+            [
+                _table("customers", ['i"d'], [], ds="2"),
+                _table("invoice", ["id", "ba_no"], [_pk(["id"]), _fk(["ba_no"], ["customers.id"], ds="2")]),
+            ],
+            "invoice_baNo",
+        ),
+    }
+
+    @staticmethod
+    def _artifacts(tables):
+        from coa_ontology.inducer.strategies.table_to_ontology import TableToOntologyStrategy
+
+        strategy = TableToOntologyStrategy()
+        onto, novel = strategy._build_proposal_ontology(PREFIX, tables, [])
+        return onto, strategy.build_r2rml(PREFIX, tables, novel, onto)
+
+    @pytest.mark.parametrize("case", list(CASES))
+    def test_unjoinable_relationship_is_unmapped_not_a_literal(self, case, caplog):
+        tables, relationship = self.CASES[case]
+        with caplog.at_level("WARNING"):
+            onto, r2rml = self._artifacts(tables)
+
+        ns = Namespace(PREFIX)
+        # The hazard is real for this case: the ontology still declares the edge.
+        assert (ns[relationship], RDF.type, OWL.ObjectProperty) in onto
+        assert _mapping_ontology_mismatches(onto, r2rml) == []
+        assert (None, RR.predicate, ns[relationship]) not in r2rml
+        assert any(record.message == "r2rml_relationship_left_unmapped" for record in caplog.records)
+
+    def test_withheld_composite_fk_with_quoted_column_stays_a_literal(self):
+        # A PENDING AI-inferred FK is withheld: the ontology declares a datatype
+        # property, so the literal still matches it.
+        fk = CatalogConstraint(
+            constraintType="FOREIGN_KEY",
+            columns=["x", "y"],
+            referredColumns=["parents.a", 'parents.b"q'],
+            relationshipType="AI_INFERRED",
+            reviewStatus="PENDING_REVIEW",
+        )
+        tables = [
+            _table("parents", ["id", "a", 'b"q'], [_pk(["id"])]),
+            _table("children", ["id", "x", "y"], [_pk(["id"]), fk]),
+        ]
+        onto, r2rml = self._artifacts(tables)
+
+        ns = Namespace(PREFIX)
+        assert (ns.children_x, RDF.type, OWL.DatatypeProperty) in onto
+        assert _mapping_ontology_mismatches(onto, r2rml) == []
+        om = r2rml.value(ns["TriplesMap_Children/POM_X"], RR.objectMap)
+        assert str(r2rml.value(om, RR.column)) == '"x"'

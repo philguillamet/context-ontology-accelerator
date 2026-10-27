@@ -38,8 +38,14 @@ from .strategies import DEFAULT_SPEC, StrategySpec
 #
 # Patching the module-level constants is the only reliable workaround.
 # TODO: Remove once graphrag-toolkit publishes a fix with active model defaults.
+#
+# Model resolution: GRAPHRAG_LLM_MODEL (explicit override), then BEDROCK_MODEL_ID
+# (serve-stack always sets it from bedrockLlmModelId, which synth validates for
+# the deploy region), then the US default. ``or`` so an empty value falls through.
 # ---------------------------------------------------------------------------
-_ACTIVE_MODEL = os.environ.get("GRAPHRAG_LLM_MODEL", "us.anthropic.claude-sonnet-5")
+_ACTIVE_MODEL = (
+    os.environ.get("GRAPHRAG_LLM_MODEL") or os.environ.get("BEDROCK_MODEL_ID") or "us.anthropic.claude-sonnet-5"
+)
 _graphrag_cfg.DEFAULT_RESPONSE_MODEL = _ACTIVE_MODEL
 _graphrag_cfg.DEFAULT_EXTRACTION_MODEL = _ACTIVE_MODEL
 
@@ -322,11 +328,15 @@ class BaselineLexicalRetriever:
 
         from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory, VectorStoreFactory
 
+        from .cross_script_prune import patch_cross_script_statement_prune
         from .graphrag_patches import patch_paginated_search_source
 
         # Must run before any index is queried: AOSS NEXTGEN omits knn_vector from the
         # default _source, which silently collapses the TopicBeamSearch beam.
         patch_paginated_search_source()
+        # A question in one script must not lose the statements written in another
+        # because a few same-script statements share a word with it (#1263).
+        patch_cross_script_statement_prune()
 
         graph_store = GraphStoreFactory.for_graph_store(self._graph_store_uri)
         # Open the topic index too, not just the toolkit default ['chunk','statement'].

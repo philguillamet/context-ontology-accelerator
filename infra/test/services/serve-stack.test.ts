@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as cdk from "aws-cdk-lib";
+import * as fs from "fs";
+import * as path from "path";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
@@ -881,7 +883,6 @@ describe("ServeStack - GRAPH_URI_TEMPLATE reader/writer alignment", () => {
   });
 });
 
-
 describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
   const envOf = (template: Template): Record<string, unknown> => {
     const runtimes = template.findResources("AWS::BedrockAgentCore::Runtime");
@@ -898,9 +899,9 @@ describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
     // The load-bearing case: a numeric 0 in cdk.json context is falsy in JS, so a
     // truthiness check would drop it. serve-stack uses `!== undefined`, so it must
     // survive as "0" and be clamped downstream rather than silently ignored.
-    expect(envOf(createStack({ serve_vkg_translation_timeout_s: 0 }))).toMatchObject(
-      { SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" },
-    );
+    expect(
+      envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
+    ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
   });
 
   it("passes a set value through verbatim", () => {
@@ -942,5 +943,96 @@ describe("ServeStack - parameter read is deliberately broad", () => {
         );
       }),
     ).toBe(true);
+  });
+});
+
+// The running coa-dev-context-manager image accreted Critical/High OS CVEs
+// (perl, openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian
+// point releases that fix them. This image is also an arm64 OCI index, which
+// ECR BASIC scanning silently refuses — so regressions here go unnoticed until
+// a child manifest is scanned by digest. The base is now AL2023. Two
+// Dockerfile properties keep the image patchable: a pinned base digest
+// (supply-chain integrity + a cache-busting bump lever) and a post-install
+// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
+// updates in past the pinned snapshot). Mirrors ontology-stack.
+describe("context-manager Dockerfile CVE hygiene", () => {
+  const dockerfile = fs.readFileSync(
+    path.join(
+      __dirname,
+      "..",
+      "..",
+      "..",
+      "packages",
+      "context-manager",
+      "Dockerfile",
+    ),
+    "utf8",
+  );
+
+  test("pins the base image to a digest, not a mutable tag", () => {
+    const from = dockerfile.match(
+      /^FROM .*amazonlinux:2023-minimal(@sha256:[a-f0-9]{64})?/m,
+    );
+    expect(from).not.toBeNull();
+    expect(from?.[1]).toMatch(/@sha256:[a-f0-9]{64}/);
+    expect(dockerfile).not.toMatch(/amazonlinux:2023-minimal\s*$/m);
+  });
+
+  test("runs dnf upgrade against the latest AL2023 release so OS security updates are applied", () => {
+    // AL2023 locks dnf to the base image's repo snapshot; without
+    // --releasever=latest a stale digest pin freezes the OS patch level.
+    expect(dockerfile).toMatch(/dnf upgrade -y --releasever=latest/);
+  });
+
+  test("upgrades pip so its own advisories are picked up", () => {
+    expect(dockerfile).toMatch(/pip install[^\n]*--upgrade pip/);
+  });
+});
+
+describe("ServeStack - Cedar policy source", () => {
+  // Serve denies every query when it has no Roles table, and uses the shipped
+  // seed policies only under the dev/test opt-in ALLOW_WITHOUT_ROLES. The
+  // deployed runtime must therefore always carry the table (and the region the
+  // shared policy loader needs), and must never carry the opt-in.
+  it("passes ROLES_TABLE_NAME and AWS_REGION to the runtime", () => {
+    createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
+      EnvironmentVariables: Match.objectLike({
+        ROLES_TABLE_NAME: Match.anyValue(),
+        AWS_REGION: Match.anyValue(),
+      }),
+    });
+  });
+
+  it("never sets the ALLOW_WITHOUT_ROLES seed-policy opt-in", () => {
+    const runtimes = createStack().findResources(
+      "AWS::BedrockAgentCore::Runtime",
+    );
+    expect(Object.keys(runtimes).length).toBeGreaterThan(0);
+    for (const runtime of Object.values(runtimes)) {
+      expect(runtime.Properties.EnvironmentVariables).not.toHaveProperty(
+        "ALLOW_WITHOUT_ROLES",
+      );
+    }
+  });
+});
+
+describe("ServeStack - teardown", () => {
+  // AgentCore's ENIs keep AgentCoreSG in use for hours after the runtime is
+  // deleted. Retained, the stack deletes at once instead of failing on the group
+  // and keeping storage, authnz and network alive; destroy.sh deletes the group.
+  it("retains the runtime security group and tags it for destroy.sh", () => {
+    createStack().hasResource("AWS::EC2::SecurityGroup", {
+      DeletionPolicy: "Retain",
+      UpdateReplacePolicy: "Retain",
+      Properties: Match.objectLike({
+        GroupDescription: "AgentCore Runtime - Context Manager",
+        Tags: Match.arrayWith([
+          {
+            Key: `${DEFAULT_RESOURCE_PREFIX}:teardown`,
+            Value: "delete-after-eni-release",
+          },
+        ]),
+      }),
+    });
   });
 });

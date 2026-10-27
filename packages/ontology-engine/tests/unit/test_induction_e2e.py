@@ -401,7 +401,7 @@ class TestInductionE2E:
         # Step 6: List proposals
         resp = http.get("/ontology/proposals/")
         assert resp.status_code == 200
-        proposals = resp.json()
+        proposals = resp.json()["proposals"]
         assert len(proposals) >= 1
         assert any(p["proposal_id"] == proposal_id for p in proposals)
 
@@ -431,13 +431,24 @@ class TestInductionE2E:
         resp = http.post(f"/ontology/proposals/{proposal_id}/upload-url")
         assert resp.status_code == 200, resp.text
         urls = resp.json()
-        assert urls["ontology_put_url"] and urls["r2rml_put_url"]
+        revision_id = urls["revisionId"]
+        assert urls["ontologyPutUrl"] and urls["r2rmlPutUrl"]
 
         uploaded_turtle = ontology_turtle.replace("Proposal Ontology", "Uploaded Reviewed Ontology")
-        ds._put_artifact_s3("default", proposal_id, "ontology", uploaded_turtle)
+        ds._put_artifact_s3(
+            "default",
+            proposal_id,
+            "ontology",
+            uploaded_turtle,
+            version=f"revisions/{revision_id}",
+        )
         resp = http.post(
             "/ontology/proposals/update",
-            json={"proposal_id": proposal_id, "ontology_uploaded": True},
+            json={
+                "proposal_id": proposal_id,
+                "ontology_uploaded": True,
+                "upload_revision_id": revision_id,
+            },
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "updated"
@@ -634,7 +645,7 @@ class TestInductionInFlightVisibilityAndLock:
         # before (indeed without) the worker ever writing the real proposal.
         resp = http.get("/ontology/proposals/")
         assert resp.status_code == 200
-        proposals = resp.json()
+        proposals = resp.json()["proposals"]
         stub = next((p for p in proposals if p["proposal_id"] == job_id), None)
         assert stub is not None, "in-flight induction should be visible in the list immediately"
         assert stub["status"] == "inducing"
@@ -742,6 +753,51 @@ class TestInductionInFlightVisibilityAndLock:
         # so a subsequent induction in this namespace is not blocked for an hour.
         assert ("default#INDUCTIONLOCK", "STATUS") not in dynamo, (
             "induction lock leaked: a post-acquire failure must release it"
+        )
+
+    def test_proposal_written_just_before_lock_acquire_still_blocks(self, client):
+        """Check-then-act race (AppSec finding V2298834428): the running worker
+        writes its pending proposal and releases the lock in the gap between a
+        new trigger's proposal check and its lock acquire. The proposal check
+        must run UNDER the lock so this trigger 409s instead of starting a
+        duplicate run, and the lock it took must be released again."""
+        http, tmpdir, dynamo = client
+        import coa_ontology.dynamo_store as ds
+
+        real_acquire = ds.acquire_induction_lock
+
+        def _acquire_after_worker_finished(namespace, job_id):
+            # The previous run's worker lands its pending proposal (and has
+            # released the lock) right before this trigger acquires it.
+            ds.create_proposal(
+                proposal_id="prev-run",
+                job_id="prev-run",
+                namespace=namespace,
+                ontology_id="https://test.com/ontology/prev#",
+                proposal_type="induction",
+                ontology_turtle="",
+                r2rml_turtle="",
+                source_type="STRUCTURED",
+            )
+            real_acquire(namespace, job_id)
+
+        with (
+            patch.object(ds, "acquire_induction_lock", side_effect=_acquire_after_worker_finished),
+            patch("coa_ontology.induce_catalog.Thread") as thread,
+        ):
+            resp = http.post(
+                "/induce/?namespace=default",
+                json={
+                    "datasource_ids": ["ds-abc123"],
+                    "ontology_uri_prefix": "https://test.com/ontology/dup#",
+                },
+            )
+
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["proposal_id"] == "prev-run"
+        thread.assert_not_called()
+        assert ("default#INDUCTIONLOCK", "STATUS") not in dynamo, (
+            "induction lock leaked: the block-until-reviewed 409 must release it"
         )
 
 

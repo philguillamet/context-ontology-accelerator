@@ -17,12 +17,19 @@ class CatalogColumn(BaseModel):
     scale: int | None = None
     description: str | None = None
     synonyms: list[str] = []
+    # Steward-reviewed business metadata. Emitted into the induced ontology
+    # (``coa:glossaryTerm`` / ``coa:tag``) so both serve paths can use them.
+    glossaryTerms: list[str] = []
+    tags: list[str] = []
     constraint: str | None = None
     ordinalPosition: int | None = None
-    tags: list[dict] = []
     # Sampled distinct values for low-cardinality categorical columns; emitted
     # into the induced ontology so serve's NL→SQL context can hint enum literals.
     distinctValues: list[str] = []
+    # Business-metadata fields whose current value COA generated in full
+    # (``description``, ``synonyms``, ``glossaryTerms``, ``tags``). Absent or empty
+    # proves nothing, so induction tags only the fields listed here.
+    generatedFields: list[str] = []
 
 
 class CatalogConstraint(BaseModel):
@@ -103,10 +110,15 @@ class CatalogTable(BaseModel):
     fullyQualifiedName: str
     description: str | None = None
     synonyms: list[str] = []
+    # Steward-reviewed business metadata (see CatalogColumn).
+    glossaryTerms: list[str] = []
+    tags: list[str] = []
     columns: list[CatalogColumn] = []
     tableConstraints: list[CatalogConstraint] | None = None
     datasourceId: str | None = None
     sourceSchema: str | None = None
+    # Table-level generated-field proof; same contract as ``CatalogColumn.generatedFields``.
+    generatedFields: list[str] = []
 
 
 class DataCatalogClient:

@@ -142,10 +142,12 @@ class TestStartInduction:
     def test_returns_202_and_job_id(self, client, mock_dynamo):
         """A valid POST with an explicit ``?namespace=`` returns 202 + job_id.
 
-        Also pins down that the worker is spawned with FOUR positional
-        args ``(job_id, body, namespace, app_config)`` where ``namespace``
-        is the explicit query value (NOT ``"default"``, NOT the body's
-        namespace field).
+        Also pins down that the worker is spawned with FIVE positional
+        args ``(job_id, body, namespace, app_config, namespace_language)``
+        where ``namespace`` is the explicit query value (NOT ``"default"``,
+        NOT the body's namespace field) and the language was resolved
+        server-side (``en`` here: the test app configures no namespaces
+        table).
         """
         with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
             response = client.post(
@@ -159,7 +161,8 @@ class TestStartInduction:
         assert body["status"] == InductionJobStatus.PENDING.value
 
         worker.assert_called_once()
-        called_job_id, called_body, called_ns, called_config = worker.call_args.args
+        called_job_id, called_body, called_ns, called_config, called_language = worker.call_args.args
+        assert called_language == "en"
         assert called_job_id == body["job_id"]
         assert isinstance(called_body, UnstructuredInductionRequest)
         assert called_body.graph_arn == _GRAPH_ARN
@@ -253,6 +256,35 @@ class TestStartInduction:
         for c in mock_dynamo.list_proposals.call_args_list:
             assert c.kwargs["source_type"] == "UNSTRUCTURED"
 
+        worker.assert_not_called()
+
+    @pytest.mark.parametrize("blocking_status", ["accept_failed", "accepting", "embeddings_sync"])
+    def test_accept_state_unstructured_proposal_returns_409(self, client, mock_dynamo, blocking_status):
+        """An unstructured proposal whose accept failed or is still merging
+        blocks a new run, same as on the structured side. Unstructured
+        proposals share the accept pipeline, so without these states a new
+        induction could start mid-merge or right after a failed accept."""
+        from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
+
+        assert blocking_status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
+
+        def _list(namespace, status, source_type):
+            return [{"proposal_id": f"{status}-prop", "namespace": namespace}] if status == blocking_status else []
+
+        mock_dynamo.list_proposals.side_effect = _list
+
+        with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
+            response = client.post(
+                f"/induce/unstructured/?namespace={_NS}",
+                json=_valid_request_body(),
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["proposal_id"] == f"{blocking_status}-prop"
+        for c in mock_dynamo.list_proposals.call_args_list:
+            assert c.kwargs["source_type"] == "UNSTRUCTURED"
+        mock_dynamo.release_induction_lock.assert_called_once_with(_NS)
+        mock_dynamo.put_job.assert_not_called()
         worker.assert_not_called()
 
     def test_pending_structured_proposal_does_not_block_unstructured_run(self, client, mock_dynamo):
@@ -365,6 +397,31 @@ class TestStartInduction:
         # retry isn't blocked for an hour.
         mock_dynamo.acquire_induction_lock.assert_called_once()
         mock_dynamo.release_induction_lock.assert_called_once_with(_NS)
+        worker.assert_not_called()
+
+    def test_proposal_written_just_before_lock_acquire_still_blocks(self, client, mock_dynamo):
+        """Check-then-act race (AppSec finding V2298834428): the running worker
+        writes its pending proposal and releases the lock in the gap between a
+        new trigger's proposal check and its lock acquire. The proposal check
+        must run UNDER the lock so this trigger 409s instead of starting a
+        duplicate run, and the lock it took must be released again."""
+
+        def _acquire_after_worker_finished(namespace, job_id):
+            mock_dynamo.list_proposals.return_value = [{"proposal_id": "prev-run", "namespace": namespace}]
+
+        mock_dynamo.acquire_induction_lock.side_effect = _acquire_after_worker_finished
+
+        with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
+            response = client.post(
+                f"/induce/unstructured/?namespace={_NS}",
+                json=_valid_request_body(),
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["proposal_id"] == "prev-run"
+        mock_dynamo.release_induction_lock.assert_called_once_with(_NS)
+        mock_dynamo.create_proposal_stub.assert_not_called()
+        mock_dynamo.put_job.assert_not_called()
         worker.assert_not_called()
 
     def test_missing_namespace_query_param_returns_422(self, client, mock_dynamo):
@@ -857,7 +914,7 @@ class TestRunUnstructuredInductionWorker:
                 )
             )
             stack.enter_context(patch.object(induce_unstructured, "EmbeddingGeneratorClient", return_value=MagicMock()))
-            stack.enter_context(
+            grounding_service_cls = stack.enter_context(
                 patch.object(
                     induce_unstructured,
                     "GroundingService",
@@ -870,6 +927,9 @@ class TestRunUnstructuredInductionWorker:
             # Expose the registry-query calls so a test can assert the
             # auto-include was scoped to ontology_type="induced".
             self._ds_list_registry_calls = list(ds.list_ontologies_registry.call_args_list)
+            # Expose the GroundingService constructor mock so a test can assert
+            # the model/region it was built with.
+            self._grounding_service_cls = grounding_service_cls
 
             pipeline_mock.run.assert_called_once()
             # First positional arg to pipeline.run is the config.
@@ -892,6 +952,70 @@ class TestRunUnstructuredInductionWorker:
         assert config.grounding_ontology_ids == ["https://fibo/FBC/"]
         assert config.grounding_mode == "ENHANCED"
         assert config.grounding_service is not None
+
+    def test_grounding_service_uses_configured_model_and_region(self):
+        """GH #236: GROUNDING_LLM_MODEL_ID (resolved into
+        ``grounding_llm_model_id``) overrides the induction default and pairs
+        with ``llm_region``, so a non-US Region can name a profile it can
+        invoke instead of the us. default."""
+        body = UnstructuredInductionRequest(
+            **_valid_request_body(),
+            grounding_ontology_ids=["fibo-agreements"],
+            grounding_mode="ENHANCED",
+        )
+        app_config = {
+            "ontology_catalog_url": "http://catalog",
+            "embedding_generator_url": "http://embed",
+            "llm_region": "ap-northeast-1",
+            "llm_model_id": "global.anthropic.claude-sonnet-5",
+            # Resolved by main.py from GROUNDING_LLM_MODEL_ID (the override).
+            "grounding_llm_model_id": "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+        }
+        config = self._run_and_capture_config(body=body, app_config=app_config, resolved_ids=["https://fibo/FBC/"])
+        assert config.grounding_service is not None
+        self._grounding_service_cls.assert_called_once()
+        kwargs = self._grounding_service_cls.call_args.kwargs
+        assert kwargs["llm_model_id"] == "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+        assert kwargs["llm_region"] == "ap-northeast-1"
+
+    def test_grounding_service_uses_resolved_grounding_model(self):
+        """With no override, main.py resolves grounding_llm_model_id to the
+        Haiku rerank default; the router forwards whatever value it is given."""
+        body = UnstructuredInductionRequest(
+            **_valid_request_body(),
+            grounding_ontology_ids=["fibo-agreements"],
+            grounding_mode="ENHANCED",
+        )
+        app_config = {
+            "ontology_catalog_url": "http://catalog",
+            "embedding_generator_url": "http://embed",
+            "llm_region": "us-east-1",
+            "llm_model_id": "global.anthropic.claude-sonnet-5",
+            # main.py's Haiku default when GROUNDING_LLM_MODEL_ID is unset.
+            "grounding_llm_model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        }
+        self._run_and_capture_config(body=body, app_config=app_config, resolved_ids=["https://fibo/FBC/"])
+        kwargs = self._grounding_service_cls.call_args.kwargs
+        assert kwargs["llm_model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def test_grounding_service_falls_back_when_grounding_model_id_is_empty(self):
+        """An empty grounding model id must not reach Bedrock as an empty
+        modelId; it falls back to the Haiku rerank default."""
+        body = UnstructuredInductionRequest(
+            **_valid_request_body(),
+            grounding_ontology_ids=["fibo-agreements"],
+            grounding_mode="ENHANCED",
+        )
+        app_config = {
+            "ontology_catalog_url": "http://catalog",
+            "embedding_generator_url": "http://embed",
+            "llm_region": "us-east-1",
+            "llm_model_id": "us.anthropic.claude-sonnet-4-6",
+            "grounding_llm_model_id": "",
+        }
+        self._run_and_capture_config(body=body, app_config=app_config, resolved_ids=["https://fibo/FBC/"])
+        kwargs = self._grounding_service_cls.call_args.kwargs
+        assert kwargs["llm_model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     def test_grounding_skipped_when_no_selection(self):
         """No grounding_ontology_ids on the request → resolver isn't consulted,

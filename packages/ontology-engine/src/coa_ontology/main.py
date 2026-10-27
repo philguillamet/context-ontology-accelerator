@@ -19,6 +19,7 @@ import defusedxml
 
 # ── Workbench-specific ──────────────────────────────────────────────────
 from coa_common import DEFAULT_EMBED_MODEL_ID
+from coa_common.bedrock import FALLBACK_CHAT_MODEL_ID
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -45,6 +46,7 @@ from coa_ontology.proposals import router as proposals_router
 # ── Pluggable backends (vector + graph abstractions) ────────────────────
 from coa_ontology.stores import build_stores
 from coa_ontology.stores.adapters import StoreOntologyCatalogAdapter
+from coa_ontology.stores.neptune_db_graph import NeptuneMemoryLimitError
 
 # ── Validation ──────────────────────────────────────────────────────────
 from coa_ontology.validation.routers import validate
@@ -137,6 +139,20 @@ async def _validation_error_handler(_request: StarletteRequest, exc: RequestVali
 _CUSTOM_VALIDATOR_ERROR_TYPES = frozenset({"value_error", "assertion_error"})
 
 
+@app.exception_handler(NeptuneMemoryLimitError)
+async def _neptune_memory_limit_handler(_request: StarletteRequest, _exc: NeptuneMemoryLimitError) -> JSONResponse:
+    """Surface a Neptune OOM that survived the store's retries as a retryable 503.
+
+    Without this it is an unhandled exception and the caller gets a bare 500,
+    indistinguishable from a real bug, so clients cannot know a retry is safe.
+    Only reached on routes that let the error propagate (e.g. ``/graph/search``).
+    """
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Graph database is temporarily out of query memory; retry the request."},
+    )
+
+
 # ── Config ──────────────────────────────────────────────────────────────
 # After MR !39 consolidation, the ontology-catalog + embedding-generator
 # routes are served by this same FastAPI app. Default these URLs to
@@ -150,6 +166,11 @@ app.state.config = {
     "ontology_catalog_url": os.getenv("ONTOLOGY_CATALOG_URL", _DEFAULT_ENGINE_SELF_URL),
     "llm_model_id": os.getenv("LLM_MODEL_ID", "us.anthropic.claude-sonnet-4-6"),
     "llm_region": os.getenv("LLM_REGION", "us-east-1"),
+    # Grounding rerank defaults to Haiku (FALLBACK_CHAT_MODEL_ID) — a cheap
+    # reranker — overridable with GROUNDING_LLM_MODEL_ID for a region-valid id
+    # (GH #236). `or` so an empty variable falls through to the Haiku default,
+    # exactly parallel to how LLM_MODEL_ID falls back to its Sonnet literal.
+    "grounding_llm_model_id": (os.getenv("GROUNDING_LLM_MODEL_ID") or FALLBACK_CHAT_MODEL_ID),
     "description_llm_model_id": os.getenv("DESCRIPTION_LLM_MODEL_ID", "us.anthropic.claude-sonnet-4-6"),
     "description_mode": os.getenv("DESCRIPTION_MODE", "schema"),
     "neptune_analytics_url": os.getenv("NEPTUNE_ANALYTICS_URL", "http://localhost:9200"),

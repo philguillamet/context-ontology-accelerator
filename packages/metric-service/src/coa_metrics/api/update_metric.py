@@ -26,6 +26,7 @@ from coa_control_plane_server.models.update_metric_request_content import (
 )
 from pydantic import ValidationError
 
+from coa_metrics.api.contract import check_metric_name
 from coa_metrics.api.create_metric import _metric_to_dict, _validate_soft
 from coa_metrics.api.validation_errors import format_validation_error
 from coa_metrics.constants import VALID_SQL_DIALECTS, invalid_dialect_message
@@ -38,6 +39,7 @@ from coa_metrics.neptune_client import (
 from coa_metrics.opensearch_client import MetricOpenSearchClient
 from coa_metrics.source_status import (
     SourceValidationUnavailableError,
+    build_validation_lookup,
     check_source_approved,
     check_source_table_exists,
 )
@@ -86,6 +88,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not name:
         return api_response(400, {"message": "Metric name is required in path"})
+    name_error = check_metric_name(name)
+    if name_error:
+        return api_response(400, {"message": name_error})
 
     # Parse request body
     try:
@@ -105,7 +110,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # Check metric exists
     existing = _get_neptune().get_metric(namespace, name)
     if existing is None:
-        return api_response(404, {"message": f"Metric '{name}' not found in namespace '{namespace}'"})
+        return api_response(404, {"message": "Metric not found in namespace"})
 
     # Build updated metric definition (includes SqlDialect validation)
     try:
@@ -115,10 +120,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     # Enforce APPROVED source and an existing sourceTable — hard 400s, matching
     # the UI's filter.
+    data_source_lookup = None
     try:
         source_error = check_source_approved(namespace, metric.data_source_id)
         if source_error is None:
-            source_error = check_source_table_exists(namespace, metric.data_source_id, metric.source_table)
+            data_source_lookup = build_validation_lookup(namespace)
+            source_error = check_source_table_exists(
+                namespace,
+                metric.data_source_id,
+                metric.source_table,
+                data_source_lookup=data_source_lookup,
+            )
     except SourceValidationUnavailableError as exc:
         logger.error("source_validation_unavailable", namespace=namespace, error=str(exc))
         return api_response(503, {"message": "Data source validation is unavailable — try again later"})
@@ -131,7 +143,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # (e.g. table_reference on provable absence) does not 400 here — it has its
     # own dedicated gate (check_source_table_exists) (Kun's review, !1133).
     # _validate_soft surfaces the check name under the "field" key.
-    findings = _validate_soft(request, namespace)
+    findings = _validate_soft(request, namespace, data_source_lookup=data_source_lookup)
     blocking = [f for f in findings if f.get("field") in BLOCKING_CHECKS]
     if blocking:
         return api_response(400, {"message": blocking[0]["message"], "errors": blocking})

@@ -37,7 +37,7 @@ from ...clients.base import GraphClient, QueryExecutor
 from ...exceptions import AccessDeniedError, AmbiguousReferenceError
 from ...identity import display_principal
 from ...step_ids import StepId
-from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError
+from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError, tables_visible_to
 from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
 from ..table_qualifier import PreparedSQL, SourceLookup, prepare_execution_sql
 from ..tools import OntologyGraphTool
@@ -345,6 +345,15 @@ class NLtoSQLStrategy:
             if (_graph_expand_enabled(options) and self._graph_client is not None)
             else None
         )
+        # Which source and database each retrieved table lives in, for a namespace
+        # pooling several Glue databases; the executor owns the sources registry.
+        table_placements = None
+        if self._query_executor and hasattr(self._query_executor, "resolve_table_placements"):
+            executor = self._query_executor
+
+            async def table_placements(table_sources: dict[str, str]) -> dict[str, tuple[str, str]]:
+                return await executor.resolve_table_placements(namespace, table_sources)
+
         nl_to_sql_result = await self._sql_generator.generate(
             query,
             namespace=namespace,
@@ -360,6 +369,7 @@ class NLtoSQLStrategy:
             # unpinned, so pre-retrieval we forward best-effort). Empty on every
             # non-declining path, keeping the prompt byte-identical to the baseline.
             governed_metric=_governed_metric_block(context.declined_metric, data_source_id),
+            table_placements=table_placements,
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)
@@ -386,7 +396,12 @@ class NLtoSQLStrategy:
 
         # Consolidate sub-steps into single t2.sql.generate/success step (E10)
         confidence = nl_to_sql_result.confidence
-        tables = nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables or []
+        # List the tables the generated SQL reads, not the retrieval context:
+        # retrieval and the FK walk put tables in front of the SQL writer that the
+        # statement may never touch (the context stays in the response metadata as
+        # ``retrieved_tables`` / ``expanded_tables``). The grant filter still applies
+        # so a name outside ``tableAllowlist`` never reaches the caller.
+        tables = tables_visible_to(SQLFirewall.referenced_tables(nl_to_sql_result.sql), profile)
         trace.record(
             StepId.T2_SQL_GENERATE,
             "success",
@@ -473,7 +488,9 @@ class NLtoSQLStrategy:
                     expanded_tables=nl_to_sql_result.expanded_tables,
                     data_source_id=nl_to_sql_result.data_source_id or "",
                 )
-                tables = nl_to_sql_result.expanded_tables or nl_to_sql_result.retrieved_tables or []
+                # The tables THIS shot's statement read (a correction shot can read
+                # different ones than the first), grant-filtered like the generate step.
+                tables = tables_visible_to(SQLFirewall.referenced_tables(fw_result.authorized_sql), profile)
 
                 # Decide whether a ZERO-row result is a legitimate, deterministic
                 # answer or a signal worth one corrective regeneration. A
@@ -596,7 +613,15 @@ class NLtoSQLStrategy:
                 sql, confidence = await self._sql_generator.correct(
                     query,
                     nl_to_sql_result.ddl_context,
-                    failed_sql=fw_result.authorized_sql,
+                    # The statement handed to the executor (post-qualification), which
+                    # is what the engine reported its line/column positions against.
+                    # The pre-qualification text differs from it on a cross-source
+                    # query (catalog/schema rewrite, single-line sqlglot rendering), so
+                    # the error coordinates pointed into a statement the model never
+                    # saw. The executor may still cap LIMIT or transpile, so this is the
+                    # closest text the strategy has to what ran. correct() is reached
+                    # only after execute() ran, so exec_sql is always set here.
+                    failed_sql=exec_sql,
                     execution_error=last_error,
                     evidence=evidence,
                     model_id=context.model_id,
@@ -685,7 +710,8 @@ class NLtoSQLStrategy:
                 StepId.T2_SQL_FIREWALL,
                 "error",
                 fw_ms,
-                detail={"error": "unsafe_sql", "message": str(e)[:200]},
+                # Fixed code only: the firewall message quotes the offending SQL.
+                detail={"error": "unsafe_sql"},
                 tool_used="sql-firewall",
             )
             logger.warning("nl_to_sql_unsafe_sql", message=str(e), security_event="unsafe_sql_attempt")

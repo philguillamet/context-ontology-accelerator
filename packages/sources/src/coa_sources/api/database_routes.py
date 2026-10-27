@@ -20,6 +20,7 @@ because they are async via SQS.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
@@ -49,6 +50,7 @@ from coa_control_plane_server.models.source_sub_type import SourceSubType
 from coa_control_plane_server.models.source_type import SourceType
 from pydantic import ValidationError as PydanticValidationError
 
+from coa_sources.client_errors import CLIENT_SAFE_FLAG, redact
 from coa_sources.database.connectors.athena_catalog import (
     AthenaCatalogConflictError,
     AthenaCatalogError,
@@ -85,6 +87,12 @@ from coa_sources.database.metrics import emit_metric
 from coa_sources.database.rescan_backup import S3_ABSENT_CODES, backup_s3_key
 from coa_sources.database.secret_binding import NAMESPACE_TAG_KEY, check_secret_namespace_binding
 
+from .contract import (
+    LIST_SOURCE_SCAN_JOBS_MAX_RESULTS,
+    LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS,
+    LIST_SOURCE_TABLES_MAX_RESULTS,
+    pagination_token_error,
+)
 from .namespace_counters import adjust_namespace_source_count
 from .sources_handler import (
     _AWS_REGION,
@@ -673,8 +681,13 @@ def _strip_external_id(config_dict: dict[str, Any], existing_config: Any = None)
     return config_dict
 
 
-def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
-    """Create a DATABASE source. db_req is a CreateDatabaseSourceInput model instance."""
+def _create_database_source(db_req: Any, namespace_id: str, *, namespace_language: str) -> dict[str, Any]:
+    """Create a DATABASE source. db_req is a CreateDatabaseSourceInput model instance.
+
+    ``namespace_language`` is the canonical language the caller resolved from the
+    namespace item. It is recorded on the scan job and carried in the scan job
+    input as the enrichment worker's snapshot.
+    """
     name: str = db_req.name.strip()
     if not name:
         return api_response(400, {"error": "name is required"})
@@ -1109,6 +1122,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                 "SK": scan_job_sk,
                 "sourceId": source_id,
                 "namespaceId": namespace_id,
+                "namespaceLanguage": namespace_language,
                 "status": "IN_PROGRESS",
                 "scanType": "full",
                 "triggerType": ScanTrigger.INITIAL,
@@ -1134,6 +1148,7 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                         "scanJobPK": f"SRC#{source_id}",
                         "scanJobSK": scan_job_sk,
                         "namespaceId": namespace_id,
+                        "namespaceLanguage": namespace_language,
                         "scanType": "full",
                     }
                 ),
@@ -1391,6 +1406,71 @@ def _scl_form_content(forms_data: list[dict[str, Any]] | None) -> str | None:
     return None
 
 
+def _find_table_asset(
+    client: SMUSClient,
+    project_id: str,
+    source_id: str,
+    table_id: str,
+) -> AssetResult | None:
+    """Find one table, tolerating temporary disagreement between search indexes.
+
+    The exact-name lookup restricts DataZone search to the name attribute,
+    while list-tables uses the normal search index. Immediately after asset
+    creation, the latter can expose a table before the former does. On an
+    exact-name miss, issue one unrestricted search for the full asset name and
+    verify candidates by exact equality.
+
+    The fallback deliberately does not paginate: synchronous review and
+    key-validation requests can resolve several assets, so each miss must cost
+    at most one additional DataZone call rather than multiplying a source-wide
+    page budget.
+    """
+    ds_key = f"DS#{source_id}"
+    asset_name = f"{ds_key}:{table_id}"
+    asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+    if asset is not None:
+        return asset
+
+    result = client.search_assets(
+        project_id=project_id,
+        search_text=asset_name,
+        max_results=50,
+        next_token=None,
+    )
+    for candidate in result.items:
+        if candidate.name == asset_name:
+            logger.info(
+                "table_asset_source_search_fallback_recovered",
+                source_id=source_id,
+                table_id=table_id,
+                asset_id=candidate.asset_id,
+            )
+            return candidate
+
+    logger.info(
+        "table_asset_source_search_fallback_missed",
+        source_id=source_id,
+        table_id=table_id,
+        additional_results_available=bool(result.next_token),
+    )
+    return None
+
+
+def _is_search_validation_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or the client error it wraps) is the catalog refusing the request as invalid.
+
+    Matches the ``ValidationException`` code and, for any other code, a plain
+    400 status: throttling, access and not-found refusals carry their own
+    statuses, so a 400 can only be a malformed request.
+    """
+    cause = exc if isinstance(exc, ClientError) else exc.__cause__
+    if not isinstance(cause, ClientError):
+        return False
+    if cause.response.get("Error", {}).get("Code") == "ValidationException":
+        return True
+    return cause.response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 400
+
+
 def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/tables."""
     from coa_common.datazone_forms import FORM_TYPE_NAME
@@ -1403,16 +1483,25 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
     qs = event.get("queryStringParameters") or {}
     review_status_filter = qs.get("reviewStatus")
     next_token = qs.get("nextToken")
+    token_error = pagination_token_error(next_token)
+    if token_error:
+        return api_response(400, {"error": token_error})
     try:
-        max_results = min(int(qs.get("maxResults", "50")), 50)  # DataZone Search API hard limit is 50
+        max_results = int(qs.get("maxResults", str(LIST_SOURCE_TABLES_MAX_RESULTS)))
     except (ValueError, TypeError):
         return api_response(400, {"error": "maxResults must be a valid integer"})
+    # The model bound is 1-50 (the DataZone Search page limit). 51-1000 was valid
+    # under the earlier bound, so it is still reduced to 50 rather than rejected.
+    if not 1 <= max_results <= LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS:
+        return api_response(400, {"error": f"maxResults must be between 1 and {LIST_SOURCE_TABLES_MAX_RESULTS}"})
+    max_results = min(max_results, LIST_SOURCE_TABLES_MAX_RESULTS)
 
     if review_status_filter:
         try:
             ReviewStatus(review_status_filter)
         except ValueError:
-            return api_response(400, {"error": f"Invalid reviewStatus: {review_status_filter}"})
+            allowed = ", ".join(s.value for s in ReviewStatus)
+            return api_response(400, {"error": f"reviewStatus must be one of: {allowed}"})
 
     project_id = _resolve_project_id(namespace_id)
     if not project_id:
@@ -1429,7 +1518,13 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
             next_token=next_token,
             include_forms=True,
         )
-    except Exception:
+    except Exception as exc:
+        # The token is the catalog search's own opaque cursor, passed through
+        # unchanged, so it cannot be checked here. Every other search parameter
+        # is built by this route, so a request the search rejects as invalid
+        # while carrying a caller token was rejected for that token.
+        if next_token and _is_search_validation_error(exc):
+            return api_response(400, {"error": "Invalid nextToken"})
         logger.exception("list_tables_search_failed", source_id=source_id, project_id=project_id)
         return api_response(500, {"error": "Failed to search tables"})
 
@@ -1598,10 +1693,8 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
 
     client = _get_smus_client()
     removed_tables, removed_columns, added_tables = _removed_sets(namespace_id, source_id)
-    ds_key = f"DS#{source_id}"
-    asset_name = f"{ds_key}:{table_id}"
     try:
-        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+        asset = _find_table_asset(client, project_id, source_id, table_id)
     except Exception:
         logger.exception("get_table_search_failed", source_id=source_id, table_id=table_id)
         return api_response(500, {"error": "Failed to search for table"})
@@ -1778,14 +1871,14 @@ def _load_single_asset(
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Search-and-load a single table asset by exact name match.
 
-    Performs 2 DataZone API calls (exact-name search + get_asset_forms),
-    independent of the total table count for the source. Returns
-    (asset_dict, None) or (None, error_response).
+    The normal path performs an exact-name search followed by
+    ``get_asset_forms``. If the exact-name index lags, the lookup performs one
+    additional unrestricted search for the full asset name before loading
+    forms or returning 404. Returns ``(asset_dict, None)`` or
+    ``(None, error_response)``.
     """
-    ds_key = f"DS#{source_id}"
-    asset_name = f"{ds_key}:{table_id}"
     try:
-        asset = client.find_asset_by_name(project_id=project_id, name=asset_name)
+        asset = _find_table_asset(client, project_id, source_id, table_id)
     except Exception:
         logger.exception("load_single_asset_search_failed", source_id=source_id, table_id=table_id)
         return None, api_response(500, {"error": "Failed to load table from catalog"})
@@ -1838,9 +1931,12 @@ def _find_source_table_assets_by_name(
     identifier, and persisting a reference outside this source would make the
     relationship impossible to validate or resolve later. The source record's
     discovered schema list is the complete namespace for its canonical
-    ``schema.table`` IDs, so probe each possible full asset name with an exact
-    DataZone filter. This proves uniqueness without catalog-wide token-search
-    pagination and retains the matched asset for metadata loading.
+    ``schema.table`` IDs, so probe each possible full asset name. Each schema
+    costs one exact-name lookup and, only while that index lags, one bounded
+    non-paginated fallback search. The worst case is therefore two DataZone
+    calls per schema; probing stops as soon as a second match proves ambiguity.
+    This preserves completeness without catalog-wide pagination and retains the
+    matched asset for metadata loading.
     """
     if not schemas:
         logger.warning("find_fk_target_tables_missing_schema_index", source_id=source_id, project_id=project_id)
@@ -1850,7 +1946,7 @@ def _find_source_table_assets_by_name(
     try:
         for schema in sorted(set(schemas)):
             table_id = f"{schema}.{table_name}"
-            asset = client.find_asset_by_name(project_id=project_id, name=f"DS#{source_id}:{table_id}")
+            asset = _find_table_asset(client, project_id, source_id, table_id)
             if asset is not None:
                 matching_assets[table_id] = asset
                 # Once two exact matches exist, the bare name is known to be
@@ -1995,25 +2091,26 @@ def _apply_business_overrides(biz: Any, overrides: dict[str, Any]) -> bool:
     Returns True if any field was changed (forces enrichmentSource to
     STEWARD_EDITED on change). Only non-None values mutate state — passing
     null/missing leaves the existing field untouched.
-    """
-    from coa_common.domain_models import EnrichmentSource
 
-    field_map = {
-        "description": "description",
-        "synonyms": "synonyms",
-        "glossaryTerms": "glossary_terms",
-        "tags": "tags",
-    }
-    changed = False
-    for in_field, out_attr in field_map.items():
+    Each changed field also loses its internal ``generated_fields`` marker: the
+    steward's text (or the steward's mix of generated and own values) is no
+    longer wholly COA-generated. Unchanged fields keep theirs.
+    """
+    from coa_common.domain_models import GENERATED_FIELD_ATTRIBUTES, EnrichmentSource
+
+    changed_fields: set[str] = set()
+    for generated_field, out_attr in GENERATED_FIELD_ATTRIBUTES.items():
+        in_field = generated_field.value
         if in_field in overrides and overrides[in_field] is not None:
             new_value = overrides[in_field]
             if getattr(biz, out_attr) != new_value:
                 setattr(biz, out_attr, new_value)
-                changed = True
-    if changed:
+                changed_fields.add(in_field)
+    if changed_fields:
+        # Record-level and coarse by design (one edited field marks the record); generated_fields tracks fields.
         biz.enrichment_source = EnrichmentSource.STEWARD_EDITED
-    return changed
+        biz.generated_fields = [f for f in biz.generated_fields if f not in changed_fields]
+    return bool(changed_fields)
 
 
 def _parse_decision(body: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
@@ -2026,7 +2123,8 @@ def _parse_decision(body: dict[str, Any]) -> tuple[str | None, dict[str, Any] | 
     try:
         ReviewDecision(decision)
     except ValueError:
-        return None, api_response(400, {"error": f"Invalid decision: {decision}"})
+        allowed = ", ".join(d.value for d in ReviewDecision)
+        return None, api_response(400, {"error": f"decision must be one of: {allowed}"})
     return decision, None
 
 
@@ -2457,7 +2555,15 @@ def _handle_update_table_keys(
             # decision a steward makes — a steward can only decide (approve/reject).
             review_status = fk.get("reviewStatus") or "" if isinstance(fk, dict) else ""
             if review_status and review_status not in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
-                return api_response(400, {"error": f"Invalid foreign key reviewStatus: {review_status!r}"})
+                return api_response(
+                    400,
+                    {
+                        "error": (
+                            "foreign key reviewStatus must be one of: "
+                            f"{ReviewStatus.APPROVED.value}, {ReviewStatus.REJECTED.value}"
+                        )
+                    },
+                )
             parsed_fks.append((col, target, tcol, review_status))
 
         # Existing rows are already persisted catalog state. The UI re-sends
@@ -2979,7 +3085,9 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         "tablesTotal": _optional_int(_scan_total(scan_item, source_item)),
         "startedAt": iso_to_epoch(scan_item.get("startedAt")),
         "completedAt": iso_to_epoch(scan_item.get("completedAt")),
-        "errorMessage": scan_item.get("errorMessage"),
+        # Redacted on read too, so rows written before the write side stored
+        # client-safe text do not return raw exception text.
+        "errorMessage": _client_error_text(scan_item),
         # A scan can SUCCEED while individual tables were unreadable, leaving those
         # tables with no columns, no comments, and no declared keys — and enrichment
         # then generates descriptions over the gap. Unsurfaced, the result is
@@ -2988,6 +3096,9 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         # clean scan's response is unchanged.
         "tablesFailed": _optional_int(scan_item.get("tablesFailed")),
         "failedTables": scan_item.get("failedTables"),
+        # Filters that looked like a regex and matched nothing (filters are globs),
+        # so the scan succeeded without the intended filtering. Absent when none.
+        "filterWarnings": scan_item.get("filterWarnings"),
         # Enrichment can partially fail independently of discovery: individual
         # tables that error (guardrail block, parse/timeout) are written back
         # without enrichment while the scan still completes. These fields name
@@ -2999,6 +3110,18 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         "enrichmentFailedTables": scan_item.get("enrichmentFailedTables"),
     }
     return api_response(200, {k: v for k, v in response.items() if v is not None})
+
+
+def _client_error_text(item: dict[str, Any]) -> str | None:
+    """A stored scan-job ``errorMessage`` as returned to the caller, or None.
+
+    Redacted, except for a message the writer flagged as written for the caller
+    (``CLIENT_SAFE_FLAG``), which is returned unchanged.
+    """
+    value = item.get("errorMessage")
+    if not value:
+        return None
+    return redact(str(value), client_safe=item.get(CLIENT_SAFE_FLAG) is True)
 
 
 def _scan_job_to_entry(item: dict[str, Any]) -> dict[str, Any]:
@@ -3018,19 +3141,65 @@ def _scan_job_to_entry(item: dict[str, Any]) -> dict[str, Any]:
         "tablesDiscovered": item.get("tablesDiscovered"),
         "tablesApproved": item.get("tablesApproved"),
         "completedAt": iso_to_epoch(item.get("completedAt")),
-        "errorMessage": item.get("errorMessage"),
+        "errorMessage": _client_error_text(item),
         "decision": item.get("decision"),
         "isRescan": item.get("isRescan"),
     }
     return {k: v for k, v in entry.items() if v is not None}
 
 
-def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
+def _encode_scan_jobs_token(last_evaluated_key: dict[str, Any]) -> str:
+    """Opaque cursor carrying only the last row's SK; the PK is re-derived from the route."""
+    return base64.urlsafe_b64encode(json.dumps({"SK": str(last_evaluated_key["SK"])}).encode()).decode()
+
+
+def _decode_scan_jobs_token(token: str, source_id: str) -> dict[str, Any] | None:
+    """The DynamoDB start key for ``token`` within ``source_id``'s partition, or None if malformed.
+
+    Only the SK comes from the caller; the PK is this route's own, so a token
+    can never start a query in another source's history.
+    """
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(token.encode()).decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(decoded, dict) or set(decoded) != {"SK"} or not isinstance(decoded["SK"], str):
+        return None
+    if not decoded["SK"] or len(decoded["SK"]) > _MAX_SCAN_JOB_SK_LENGTH:
+        return None
+    return {"PK": f"SRC#{source_id}", "SK": decoded["SK"]}
+
+
+# Scan-job SKs are ISO timestamps; GetSourceScanJob bounds a jobId (the SK) at 128.
+_MAX_SCAN_JOB_SK_LENGTH = 128
+
+
+def _handle_list_scan_jobs(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/scan.
 
-    Lists every scan-job and review-event row for the source, newest first.
-    PK = SRC#{sourceId}; rows are sorted by SK (ISO timestamp) descending.
+    Lists the source's scan-job and review-event rows, newest first, one page at
+    a time. PK = SRC#{sourceId}; rows are read by SK (ISO timestamp) descending.
+    No ``nextToken`` returns the newest page; ``maxResults`` defaults to the
+    maximum (``LIST_SOURCE_SCAN_JOBS_MAX_RESULTS``, 1000), which covers a typical
+    source's whole history in one page.
     """
+    qs = event.get("queryStringParameters") or {}
+    next_token = qs.get("nextToken")
+    token_error = pagination_token_error(next_token)
+    if token_error:
+        return api_response(400, {"error": token_error})
+    try:
+        max_results = int(qs.get("maxResults", str(LIST_SOURCE_SCAN_JOBS_MAX_RESULTS)))
+    except (ValueError, TypeError):
+        return api_response(400, {"error": "maxResults must be a valid integer"})
+    if not 1 <= max_results <= LIST_SOURCE_SCAN_JOBS_MAX_RESULTS:
+        return api_response(400, {"error": f"maxResults must be between 1 and {LIST_SOURCE_SCAN_JOBS_MAX_RESULTS}"})
+    start_key: dict[str, Any] | None = None
+    if next_token:
+        start_key = _decode_scan_jobs_token(next_token, source_id)
+        if start_key is None:
+            return api_response(400, {"error": "Invalid nextToken"})
+
     try:
         source_item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
     except ClientError:
@@ -3041,11 +3210,13 @@ def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
         return api_response(404, {"error": f"Source '{source_id}' not found"})
 
     try:
-        rows = _get_scan_dao().query_all(
+        page = _get_scan_dao().query(
             QueryParams(
                 key_condition="#pk = :pk",
                 expression_values={":pk": f"SRC#{source_id}"},
                 expression_names={"#pk": "PK"},
+                limit=max_results,
+                exclusive_start_key=start_key,
                 scan_forward=False,
             )
         )
@@ -3055,9 +3226,11 @@ def _handle_list_scan_jobs(namespace_id: str, source_id: str) -> dict[str, Any]:
 
     # Sort newest-first by SK regardless of the store's return order (belt and
     # suspenders alongside scan_forward=False).
-    rows.sort(key=lambda r: str(r.get("SK", "")), reverse=True)
-    items = [_scan_job_to_entry(r) for r in rows]
-    return api_response(200, {"items": items})
+    rows = sorted(page.items, key=lambda r: str(r.get("SK", "")), reverse=True)
+    body: dict[str, Any] = {"items": [_scan_job_to_entry(r) for r in rows]}
+    if page.last_evaluated_key and page.last_evaluated_key.get("SK"):
+        body["nextToken"] = _encode_scan_jobs_token(page.last_evaluated_key)
+    return api_response(200, body)
 
 
 # ---------------------------------------------------------------------------
@@ -3128,7 +3301,7 @@ def _schedule_expression_error(expression: str) -> str | None:
     if cron:
         minute = (cron.group(1).strip().split() or [""])[0]
         if not minute.isdigit():
-            return f"cron minute field must be a single value so the cadence can be bounded; got '{minute}'"
+            return "cron minute field must be a single value so the cadence can be bounded"
         # A literal minute bounds it at hourly, which is the strongest bound
         # available without a full cron interval analysis.
         if _MIN_RESCAN_INTERVAL_S > 3600:
@@ -3163,15 +3336,23 @@ def _upsert_rescan_schedule(namespace_id: str, source_id: str, expression: str, 
             raise
 
 
-def _delete_rescan_schedule(source_id: str) -> None:
-    """Best-effort delete of a source's rescan schedule (no-op when absent)."""
+def _delete_rescan_schedule(source_id: str) -> bool:
+    """Delete a source's rescan schedule.
+
+    Returns True when the schedule is gone (deleted, already absent, or
+    scheduling not configured) and False when the delete failed and the
+    schedule may still be live. Never raises, so cleanup callers can treat it
+    as best-effort; the disable route reads the result instead.
+    """
     if not _RESCAN_SCHEDULE_GROUP:
-        return
+        return True
     try:
         _get_scheduler().delete_schedule(Name=_schedule_name(source_id), GroupName=_RESCAN_SCHEDULE_GROUP)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
             logger.warning("rescan_schedule_delete_failed", source_id=source_id, exc_info=True)
+            return False
+    return True
 
 
 def _handle_put_rescan_schedule(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
@@ -3214,13 +3395,21 @@ def _handle_put_rescan_schedule(event: dict[str, Any], namespace_id: str, source
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code == "ValidationException":
-                msg = exc.response.get("Error", {}).get("Message", "invalid schedule expression")
-                return api_response(400, {"error": f"Invalid schedule: {msg}"})
+                # EventBridge's own message is not forwarded: it is raw service text.
+                logger.info("rescan_schedule_rejected_by_scheduler", source_id=source_id, exc_info=True)
+                return api_response(
+                    400,
+                    {"error": "Invalid schedule: EventBridge Scheduler rejected the scheduleExpression or timezone"},
+                )
             logger.exception("rescan_schedule_upsert_failed", source_id=source_id)
             return api_response(500, {"error": "Failed to configure schedule"})
         schedule: dict[str, Any] = {"enabled": True, "scheduleExpression": expression, "timezone": timezone}
     else:
-        _delete_rescan_schedule(source_id)
+        # A schedule that survived a failed delete keeps firing, so recording
+        # OFF here would tell the steward the source is frozen when it is not.
+        # Leave the record as it was and let the caller retry.
+        if not _delete_rescan_schedule(source_id):
+            return api_response(500, {"error": "Failed to remove schedule"})
         schedule = {"enabled": False}
 
     try:
@@ -3376,19 +3565,40 @@ def _enable_event_rule(namespace_id: str, source_id: str, database_name: str) ->
     )
 
 
-def _disable_event_rule(source_id: str) -> None:
-    """Best-effort delete of a source's Glue-event rule (no-op when absent)."""
+def _disable_event_rule(source_id: str) -> bool:
+    """Delete a source's Glue-event rule and its target.
+
+    Returns True when the rule is gone (deleted, already absent, or event
+    rescans not configured) and False when either call failed and the rule may
+    still route events to the queue. Never raises, so cleanup callers can treat
+    it as best-effort; the disable route reads the result instead.
+    """
     if not _GLUE_EVENT_RULE_PREFIX:
-        return
+        return True
     events = _get_events()
     name = _event_rule_name(source_id)
-    with contextlib.suppress(ClientError):
-        events.remove_targets(Rule=name, Ids=["glue-event-queue"])
+    try:
+        resp = events.remove_targets(Rule=name, Ids=["glue-event-queue"])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
+            logger.warning("event_rule_target_remove_failed", source_id=source_id, exc_info=True)
+            return False
+    else:
+        # RemoveTargets reports per-target failures in the body, not as an error.
+        if isinstance(resp, dict) and resp.get("FailedEntryCount"):
+            logger.warning(
+                "event_rule_target_remove_failed",
+                source_id=source_id,
+                failed_entries=resp.get("FailedEntries"),
+            )
+            return False
     try:
         events.delete_rule(Name=name)
     except ClientError as exc:
         if exc.response.get("Error", {}).get("Code") != "ResourceNotFoundException":
             logger.warning("event_rule_delete_failed", source_id=source_id, exc_info=True)
+            return False
+    return True
 
 
 def _handle_put_event_rescan(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
@@ -3435,7 +3645,11 @@ def _handle_put_event_rescan(event: dict[str, Any], namespace_id: str, source_id
             return api_response(500, {"error": "Failed to configure event-driven rescans"})
         config: dict[str, Any] = {"enabled": True}
     else:
-        _disable_event_rule(source_id)
+        # A rule that survived a failed delete keeps routing Glue changes to
+        # the queue, so recording OFF would be untrue. Leave the record as it
+        # was and let the caller retry.
+        if not _disable_event_rule(source_id):
+            return api_response(500, {"error": "Failed to remove event-driven rescans"})
         config = {"enabled": False}
 
     try:

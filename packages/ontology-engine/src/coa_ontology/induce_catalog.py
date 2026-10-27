@@ -26,13 +26,22 @@ from coa_common.bedrock_metrics import (
     emit_induction_heartbeat_metrics,
     emit_induction_job_metrics,
 )
-from coa_common.constants import DATABASE_SUB_TYPES
+from coa_common.constants import DATABASE_SUB_TYPES, validate_ontology_uri_prefix
+from coa_common.language_tags import DEFAULT_LANGUAGE
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from coa_ontology import dynamo_store
 from coa_ontology.datasource_ids import bare_datasource_id, is_valid_datasource_id
+from coa_ontology.inducer.services.generated_text import render
 from coa_ontology.inducer.strategies import get_strategy
+from coa_ontology.inducer.strategies.rigor_ontology import rigor_supports_language
+from coa_ontology.namespace_language import (
+    NamespaceLanguageNotFoundError,
+    NamespaceLanguageUnconfiguredError,
+    resolve_namespace_language,
+)
+from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
 
 if TYPE_CHECKING:
     # Type-only: ``inducer.schemas`` is deliberately NOT imported at runtime here
@@ -171,6 +180,24 @@ class NamespaceMissingProjectError(ValueError):
     """Raised when a namespace exists but has no DataZone project provisioned."""
 
 
+def namespace_language_or_404(namespace: str, config: dict) -> str:
+    """Resolve the namespace language for an induction route.
+
+    A missing namespace is a 404 and a missing namespaces table (outside the
+    local HTTP catalog) a 500, matching ``_fetch_catalog_from_smus``; any other
+    read failure propagates as a 500. That includes a ``LanguageTagError`` for
+    a stored value outside the supported grammar: CreateNamespace canonicalizes
+    the language before it writes the item, so such a value is a corrupt
+    server-side record, not a client error.
+    """
+    try:
+        return resolve_namespace_language(namespace, config)
+    except NamespaceLanguageNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
+    except NamespaceLanguageUnconfiguredError as e:
+        raise HTTPException(500, str(e)) from e
+
+
 _jobs: dict = {}
 _job_namespaces: dict[str, str] = {}  # job_id → namespace
 
@@ -218,7 +245,10 @@ class WorkbenchInductionRequest(BaseModel):
     grounding_mode: str = Field(
         default="ENHANCED", validation_alias=AliasChoices("grounding_mode", "groundingMode")
     )  # "NONE" | "STANDARD" | "ENHANCED"
-    graph_arn: str | None = None
+    graph_arn: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("graph_arn", "graphArn"),
+    )
 
     @field_validator("ontology_uri_prefix")
     @classmethod
@@ -235,9 +265,12 @@ class WorkbenchInductionRequest(BaseModel):
         EVERY class is marked unmapped → the whole namespace goes dark to Tier-2.
         The same value is also stored as the ontology_id / graph URI, so
         normalizing once here keeps all downstream consumers consistent.
+
+        The prefix is also charset-checked (``validate_ontology_uri_prefix``)
+        before normalizing, since it is minted into every induced IRI.
         """
-        v = v.strip()
-        if v and not v.endswith(("#", "/")):
+        v = validate_ontology_uri_prefix(v)
+        if not v.endswith(("#", "/")):
             v += "#"
         return v
 
@@ -369,8 +402,38 @@ def _fetch_catalog_from_fixture(datasource_id: str) -> dict:
     return {"databases": []}
 
 
+def fetch_datasource_catalog(config: dict, datasource_id: str, *, namespace: str) -> dict:
+    """The catalog of one datasource, from wherever this deployment reads catalogs.
+
+    Shared by induction and by the proposal update that rebuilds a structured
+    proposal, so both resolve a datasource the same way. A mock datasource (ID ending
+    in ``-mock``) reads the bundled fixture; otherwise ``CATALOG_SOURCE`` picks SMUS or
+    the HTTP data catalog. The helpers are looked up at call time, so tests that
+    patch them on this module still take effect.
+    """
+    if datasource_id.endswith("-mock"):
+        # Mock datasources read from bundled JSON fixture (no SMUS / no Glue)
+        return _fetch_catalog_from_fixture(datasource_id)
+    if config.get("catalog_source") == "smus":
+        return _fetch_catalog_from_smus(config, datasource_id, namespace=namespace)
+    return _fetch_catalog(config["data_catalog_url"], datasource_id)
+
+
+def _string_list(value: object) -> list[str]:
+    """Normalize a catalog list field to non-empty strings (``None`` → ``[]``)."""
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if v is not None and str(v).strip()]
+
+
 def _catalog_to_tables(catalog: dict) -> list[dict]:
-    """Flatten catalog → databases → tables into CatalogTable-compatible dicts."""
+    """Flatten catalog → databases → tables into CatalogTable-compatible dicts.
+
+    Carries every steward-reviewed business-metadata field the catalog exposes
+    (description, synonyms, glossary terms, tags) so induction can emit all of
+    them into the ontology. Glossary terms and tags were previously dropped here,
+    which made their review on the source screen have no effect on any answer.
+    """
     tables = []
     for db in catalog.get("databases", []):
         db_name = db.get("name", "")
@@ -385,12 +448,15 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                         "dataType": col.get("type", ""),
                         "description": cbm.get("description"),
                         "synonyms": cbm.get("synonyms", []),
+                        "glossaryTerms": _string_list(cbm.get("glossaryTerms")),
+                        "tags": _string_list(cbm.get("tags")),
                         # Sampled distinct values (low-cardinality categorical cols)
                         # flow into the induced ontology for serve NL→SQL enum hints.
                         "distinctValues": col.get("distinctValues", []),
                         "constraint": "PRIMARY_KEY"
                         if col["name"] in ((tbl.get("primaryKey") or {}).get("columns") or [])
                         else None,
+                        "generatedFields": cbm.get("generatedFields") or [],
                     }
                 )
             # ``relationshipType`` carries the FK provenance tag
@@ -440,8 +506,11 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                     "sourceSchema": db_name or None,
                     "description": bm.get("description"),
                     "synonyms": bm.get("synonyms", []),
+                    "glossaryTerms": _string_list(bm.get("glossaryTerms")),
+                    "tags": _string_list(bm.get("tags")),
                     "columns": columns,
                     "tableConstraints": pk_constraints + fk_constraints or None,
+                    "generatedFields": bm.get("generatedFields") or [],
                 }
             )
     return tables
@@ -697,9 +766,11 @@ def _run_induction(
     build_pipeline_fn,
     schemas_mod,
     catalog_table_cls,
+    namespace_language: str = DEFAULT_LANGUAGE,
 ):
     job = _jobs[job_id]
     ns = namespace
+    proposal_label = body.label or render("structured_proposal_title", namespace_language)
     _t_start = time.perf_counter()
     # One tracker per job, shared across every Bedrock seam reached below
     # (grounding rerank + LLM generate). Metrics are emitted exactly once on
@@ -724,13 +795,7 @@ def _run_induction(
             all_tables = []
             datasource_details = []
             for ds_id in body.datasource_ids:
-                if ds_id.endswith("-mock"):
-                    # Mock datasources read from bundled JSON fixture (no SMUS / no Glue)
-                    catalog = _fetch_catalog_from_fixture(ds_id)
-                elif config.get("catalog_source") == "smus":
-                    catalog = _fetch_catalog_from_smus(config, ds_id, namespace=ns)
-                else:
-                    catalog = _fetch_catalog(config["data_catalog_url"], ds_id)
+                catalog = fetch_datasource_catalog(config, ds_id, namespace=ns)
                 tbl_dicts = _catalog_to_tables(catalog)
                 from coa_ontology.inducer.strategies.base import schema_from_fqn
 
@@ -924,6 +989,7 @@ def _run_induction(
                 grounding_ontology_ids=resolved_grounding_ids,
                 grounding_mode=body.grounding_mode,
                 cost_tracker=cost_tracker,
+                namespace_language=namespace_language,
             )
             r2rml_graph = strategy_instance.build_r2rml(
                 ontology_uri_prefix=body.ontology_uri_prefix,
@@ -987,7 +1053,7 @@ def _run_induction(
                 r2rml_turtle=r2rml_ttl,
                 source_type="STRUCTURED",
                 metadata={
-                    "label": body.label or "Induced Structured Ontology",
+                    "label": proposal_label,
                     "tables_processed": len(all_tables),
                     "columns_processed": sum(len(t.columns) for t in all_tables),
                     "novel_classes_created": novel_count,
@@ -1013,6 +1079,9 @@ def _run_induction(
                     "grounding_ontologies_used": grounding_report_uris,
                     "structural_fingerprint": fingerprint,
                     "has_constraint_config": True,
+                    # Diagnostic snapshot of the immutable namespace language this
+                    # run used; the namespace remains the authority.
+                    "namespaceLanguage": namespace_language,
                 },
             )
 
@@ -1139,36 +1208,54 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
         The pending :class:`JobResponse` for the newly started job.
 
     Raises:
-        HTTPException: 422 if the Neptune endpoint is unconfigured for an
-            unstructured run, or 409 if another induction/proposal is in flight.
+        HTTPException: 404 if the namespace does not exist, 400 if the strategy
+            is ``rigor_ontology`` and the namespace language is not English, 422
+            if the requested lexical source is unsupported or the Neptune
+            endpoint is unconfigured for an unstructured run, or 409 if another
+            induction/proposal is in flight.
     """
+    # Resolve the immutable namespace language once, before any job state is
+    # written, and hand it to whichever pipeline runs.
+    namespace_language = namespace_language_or_404(namespace, request.app.state.config)
+    if body.strategy == "rigor_ontology" and not rigor_supports_language(namespace_language):
+        raise HTTPException(
+            400,
+            (
+                f"The rigor_ontology strategy supports only English namespaces; this namespace's language is "
+                f"{namespace_language}. Use table_to_ontology."
+            ),
+        )
+
     # Dispatch to unstructured pipeline if strategy is unstructured_lexical_graph
     if getattr(body, "strategy", "") == "unstructured_lexical_graph":
         from coa_ontology.inducer.routers.induce_unstructured import (
             UnstructuredInductionRequest,
-        )
-        from coa_ontology.inducer.routers.induce_unstructured import (
-            start_induction as start_unstructured,
+            start_unstructured_job,
         )
 
-        # graph_arn must satisfy UnstructuredInductionRequest's SSRF guard:
-        # EITHER a canonical Neptune Analytics ARN OR the literal "neptune-db"
-        # sentinel (which tells the unstructured worker to resolve the NDB
-        # endpoint from server-side config — see _build_lexical_store; the
-        # caller-supplied value is never used as an endpoint URL). If the caller
-        # passed an explicit NA ARN, forward it; otherwise use the "neptune-db"
-        # sentinel. Passing the raw NDB cluster URL here fails the regex → 500
-        # (regression once the SSRF pattern landed on the request schema).
-        explicit_arn = getattr(body, "graph_arn", None)
-        graph_arn = explicit_arn if explicit_arn and explicit_arn.startswith("arn:aws:neptune-graph:") else "neptune-db"
+        graph_arn = getattr(body, "graph_arn", None) or "neptune-db"
+        if graph_arn != "neptune-db":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "UNSUPPORTED_SOURCE",
+                    "message": "The requested lexical graph source is not supported.",
+                },
+            )
         if graph_arn == "neptune-db" and not request.app.state.config.get("neptune_endpoint", ""):
-            raise HTTPException(422, "Neptune endpoint not configured for unstructured induction")
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "CONFIGURATION_ERROR",
+                    "message": "The lexical graph source is not configured.",
+                },
+            )
 
         unstructured_body = UnstructuredInductionRequest(
             graph_arn=graph_arn,
             name="unstructured",
             ontology_uri_prefix=body.ontology_uri_prefix,
-            label="Unstructured Induction",
+            label=render("unstructured_dispatch_title", namespace_language),
             datasource_ids=body.datasource_ids,
             confidence_threshold=getattr(body, "confidence_threshold", 0.8),
             # Forward foundational-grounding params so the unstructured path
@@ -1181,7 +1268,12 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             grounding_mode=getattr(body, "grounding_mode", "ENHANCED"),
             rerank_max_tokens=getattr(body, "rerank_max_tokens", 1000),
         )
-        return start_unstructured(body=unstructured_body, request=request, namespace=namespace)
+        return start_unstructured_job(
+            body=unstructured_body,
+            request=request,
+            namespace=namespace,
+            namespace_language=namespace_language,
+        )
 
     # Enforce one in-flight induction at a time per namespace, in two layers:
     #
@@ -1203,23 +1295,14 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
     # embeddings_sync) — the induction lock is only held for the duration of an
     # induction, so without the in-flight accept states a new induction can start
     # mid-merge and leave two competing structured proposals in the namespace.
+    #
+    # Layer 1 is checked AFTER layer 2's lock is acquired, not before. Checking
+    # first left a check-then-act gap: a trigger could see no proposal, the
+    # running worker could then write its pending proposal and release the
+    # lock, and the trigger would acquire it and start a duplicate run beside
+    # an unreviewed proposal. The worker writes its proposal before releasing,
+    # so once we hold the lock the proposal read is authoritative.
     from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
-
-    pending: list[dict] = []
-    for _status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION:
-        pending = dynamo_store.list_proposals(namespace=namespace, status=_status, source_type="STRUCTURED")
-        if pending:
-            break
-    if pending:
-        raise HTTPException(
-            409,
-            {
-                "message": (
-                    "An in-flight proposal already exists. Accept or reject it before starting a new induction job."
-                ),
-                "proposal_id": pending[0]["proposal_id"],
-            },
-        )
 
     job_id = str(uuid.uuid4())
 
@@ -1243,7 +1326,24 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
     # worker's finally only runs if the worker THREAD actually starts, so a
     # failure in put_job / create_proposal_stub / Thread.start() here would
     # otherwise leak the lock and wedge the namespace until the stale timeout.
+    # The same handler releases it when the block-until-reviewed 409 fires.
     try:
+        pending: list[dict] = []
+        for _status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION:
+            pending = dynamo_store.list_proposals(namespace=namespace, status=_status, source_type="STRUCTURED")
+            if pending:
+                break
+        if pending:
+            raise HTTPException(
+                409,
+                {
+                    "message": (
+                        "An in-flight proposal already exists. Accept or reject it before starting a new induction job."
+                    ),
+                    "proposal_id": pending[0]["proposal_id"],
+                },
+            )
+
         _jobs[job_id] = _schemas_mod.JobResponse(
             job_id=job_id,
             status=_schemas_mod.JobStatus.PENDING,
@@ -1262,7 +1362,7 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             namespace=namespace,
             ontology_id=body.ontology_uri_prefix,
             source_type="STRUCTURED",
-            label=body.label or "Induced Structured Ontology",
+            label=body.label or render("structured_proposal_title", namespace_language),
         )
 
         # Write initial job record to DynamoDB.
@@ -1277,7 +1377,16 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
 
         Thread(
             target=_run_induction,
-            args=(job_id, body, namespace, config, _build_pipeline, _schemas_mod, _catalog_table_cls),
+            args=(
+                job_id,
+                body,
+                namespace,
+                config,
+                _build_pipeline,
+                _schemas_mod,
+                _catalog_table_cls,
+                namespace_language,
+            ),
             daemon=True,
         ).start()
     except Exception:
@@ -1490,13 +1599,37 @@ def _job_summary(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ListInductionJobs ``maxResults`` default and bound. The max equals the Smithy
+# ``ListInductionJobs.maxResults`` @range max (checked by a parity test).
+LIST_INDUCTION_JOBS_DEFAULT_MAX_RESULTS = 50
+LIST_INDUCTION_JOBS_MAX_RESULTS = 200
+
+
+def jobs_list_scope(namespace: str) -> str:
+    """``nextToken`` scope of a ListInductionJobs listing (see :mod:`coa_ontology.pagination`)."""
+    return f"jobs:{namespace}"
+
+
 @router.get("/jobs")
 def list_jobs(
     namespace: str,
     status: str | None = None,
-    max_results: int = Query(50, alias="maxResults", ge=1, le=200),
-) -> list[dict[str, Any]]:
-    """List a namespace's induction jobs as contract summaries, from DynamoDB.
+    max_results: int = Query(
+        LIST_INDUCTION_JOBS_DEFAULT_MAX_RESULTS, alias="maxResults", ge=1, le=LIST_INDUCTION_JOBS_MAX_RESULTS
+    ),
+    next_token: str | None = Query(None, alias="nextToken"),
+) -> dict[str, Any]:
+    """List one page of a namespace's induction jobs, from DynamoDB.
+
+    Returns the Smithy ``ListInductionJobs`` output,
+    ``{"jobs": [InductionJobSummary, ...], "nextToken": "..."}``. ``nextToken`` is
+    present only when more results may follow; pass it back unchanged for the
+    next page. A malformed token, or one minted for another namespace, is a 400.
+
+    A page can hold fewer than ``maxResults`` jobs — even none — while
+    ``nextToken`` is present: each request reads a bounded slice of the table
+    (see :data:`dynamo_store.MAX_SCAN_CALLS_PER_PAGE`). Keep paging until
+    ``nextToken`` is absent.
 
     Reads the durable job rows, NOT the in-memory ``_jobs`` dict. ``_jobs`` only
     holds jobs started by the task serving the request and is wiped on every
@@ -1519,17 +1652,29 @@ def list_jobs(
     Args:
         namespace: Namespace whose jobs to list.
         status: Optional ``InductionJobStatus`` filter (contract ``status``).
-        max_results: Cap on returned jobs (contract ``maxResults``), 1–200.
+        max_results: Page size (contract ``maxResults``), 1–200.
+        next_token: Opaque resume token from a previous page (contract ``nextToken``).
 
     Returns:
-        One ``InductionJobSummary``-shaped dict per persisted job, newest first.
-        Returns an empty list (rather than a 500) if the underlying DynamoDB
-        scan fails — this is a read-only listing endpoint, and degrading to
-        "no jobs shown" is preferable to making the endpoint unavailable
-        during transient throttling or network issues.
+        One page of ``InductionJobSummary``-shaped dicts, newest first WITHIN the
+        page (DynamoDB scan order is not time order, so ordering across pages is
+        not guaranteed).
+
+    Raises:
+        HTTPException: 400 for a bad ``nextToken``; 503 when the DynamoDB scan
+            fails. An empty 200 there would read as "no more jobs" and silently
+            truncate a client that is paging, so the failure is surfaced and the
+            client can retry the same token.
     """
+    scope = jobs_list_scope(namespace)
     try:
-        items = dynamo_store.list_jobs(namespace=namespace, status=status, limit=max_results)
+        start_key = decode_next_token(next_token, scope=scope)
+    except InvalidNextToken as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        items, next_key = dynamo_store.list_jobs_page(
+            namespace=namespace, status=status, limit=max_results, exclusive_start_key=start_key
+        )
     except Exception:
         _log.exception(
             "list_jobs_scan_failed namespace=%s status=%s max_results=%s",
@@ -1537,9 +1682,9 @@ def list_jobs(
             status,
             max_results,
         )
-        return []
+        raise HTTPException(status_code=503, detail="Induction jobs are temporarily unavailable; retry.") from None
     items.sort(key=lambda i: str(i.get("created_at") or ""), reverse=True)
-    return [_job_summary(item) for item in items]
+    return page_body("jobs", [_job_summary(item) for item in items], next_key, scope=scope)
 
 
 # Terminal IngestJobState values (see ontology-graph.smithy) — an ingest job
@@ -1658,12 +1803,37 @@ def list_datasources(request: Request, namespace: str):
     return result
 
 
+# ListInducedDatasources ``maxResults`` bound (and default: a caller that does not
+# page gets everything up to the bound). Equals the Smithy @range max.
+LIST_INDUCED_DATASOURCES_MAX_RESULTS = 1000
+
+
 @router.get("/datasources/induced")
-def list_induced_datasources(namespace: str):
-    """Return distinct datasource IDs from all accepted proposals in a namespace."""
+def list_induced_datasources(
+    namespace: str,
+    max_results: int = Query(
+        LIST_INDUCED_DATASOURCES_MAX_RESULTS, alias="maxResults", ge=1, le=LIST_INDUCED_DATASOURCES_MAX_RESULTS
+    ),
+    next_token: str | None = Query(None, alias="nextToken"),
+) -> dict[str, Any]:
+    """List one page of the distinct datasources behind a namespace's accepted proposals.
+
+    Returns the Smithy ``ListInducedDatasources`` output,
+    ``{"datasources": [...], "nextToken": "..."}``, ordered by ``datasourceId``.
+    The set is derived (deduplicated across every accepted proposal), so each
+    request reads all accepted proposals; paging bounds the response and the
+    per-datasource name lookups, not the proposal read. ``nextToken`` carries the
+    last ``datasourceId`` returned.
+    """
     import boto3
 
-    proposals = dynamo_store.list_proposals(namespace=namespace, status="accepted")
+    scope = f"induced-datasources:{namespace}"
+    try:
+        start_key = decode_next_token(next_token, scope=scope, pk=namespace)
+    except InvalidNextToken as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    proposals = dynamo_store.list_proposals(namespace=namespace, status="accepted", limit=None)
     ds_set: dict[str, dict] = {}
     for p in proposals:
         meta = p.get("metadata") or {}
@@ -1682,11 +1852,18 @@ def list_induced_datasources(namespace: str):
                     "novel_classes_created": meta.get("novel_classes_created", meta.get("class_count", 0)),
                 }
 
+    ordered = sorted(ds_set)
+    if start_key:
+        ordered = [ds_id for ds_id in ordered if ds_id > start_key["SK"]]
+    page = [ds_set[ds_id] for ds_id in ordered[:max_results]]
+    next_key = {"PK": namespace, "SK": page[-1]["datasourceId"]} if len(ordered) > max_results else None
+
     # Resolve source names from the sources table
     sources_table = os.environ.get("SOURCES_TABLE", "")
-    if sources_table and ds_set:
+    if sources_table and page:
         table = boto3.resource("dynamodb", region_name=os.environ.get("AWS_REGION", "us-east-1")).Table(sources_table)
-        for ds_id, entry in ds_set.items():
+        for entry in page:
+            ds_id = entry["datasourceId"]
             try:
                 resp = table.get_item(Key={"PK": f"NS#{namespace}", "SK": f"SRC#{ds_id}"})
                 item = resp.get("Item")
@@ -1695,4 +1872,4 @@ def list_induced_datasources(namespace: str):
             except Exception:
                 pass  # fall back to showing UUID
 
-    return list(ds_set.values())
+    return page_body("datasources", page, next_key, scope=scope)

@@ -81,7 +81,7 @@ Platform grants are managed from the **Identity** page in the web app, or via
 and `DELETE /grants/{grantId}` (**DeletePlatformGrant**) — see the
 [API Reference](#/api-reference) for the full request/response schemas.
 Grants accept either `principalType: "User"` (an email) or `"Group"`
-(matching an IdP group name).
+(matching an IdP group name). Create calls are retry-safe with an optional `clientToken` — see [Retrying Creates Safely](namespaces.md#retrying-creates-safely).
 
 !!! note
     The **Grant access** dialog on the Identity page validates only the
@@ -96,6 +96,7 @@ Grants accept either `principalType: "User"` (an email) or `"Group"`
 Namespace grants are managed from the **Permissions** tab within a namespace,
 or via `POST /namespaces/{namespaceId}/grants` (**CreateGrant**) — see the
 [API Reference](#/api-reference) for the full request/response schema.
+Create calls are retry-safe with an optional `clientToken` — see [Retrying Creates Safely](namespaces.md#retrying-creates-safely).
 
 ### Grant with Data-Level Restrictions
 
@@ -107,7 +108,7 @@ Cedar (at query execution time by the SQL Firewall) — see the
 
 | Field | Type | Effect |
 |-------|------|--------|
-| `tableAllowlist` | `list[string]` | Only these tables can be queried. Any other table reference is denied. |
+| `tableAllowlist` | `list[string]` | Only these tables can be queried. Any other table reference is denied, and other tables' names are left out of the query trace and response metadata. |
 | `columnDenylist` | `map[string, list[string]]` | These columns cannot be projected. `SELECT *` on a restricted table is denied. |
 | `allowedMetrics` | `list[string]` | Only these metric IDs can be evaluated. |
 

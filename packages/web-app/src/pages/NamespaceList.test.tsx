@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React from "react";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { LocaleProvider } from "../i18n/LocaleProvider";
 import {
   NamespaceList,
   getStatusActionItems,
@@ -20,6 +21,9 @@ let mockNamespaces: Array<{
   name: string;
   status: string;
   sourceCount?: number;
+  language?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }> = [];
 
 vi.mock("../api-hooks", () => ({
@@ -46,6 +50,14 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
   </QueryClientProvider>
 );
 
+const localizedWrapper = ({ children }: { children: React.ReactNode }) => (
+  <LocaleProvider>
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>{children}</MemoryRouter>
+    </QueryClientProvider>
+  </LocaleProvider>
+);
+
 describe("NamespaceList", () => {
   beforeEach(() => {
     mockNamespaces = [];
@@ -67,6 +79,98 @@ describe("NamespaceList", () => {
     expect(
       screen.getAllByRole("button", { name: /create namespace/i }).length,
     ).toBeGreaterThan(0);
+  });
+
+  it("formats namespace dates with the selected application locale", async () => {
+    window.localStorage.setItem("scl.locale", "ja");
+    mockNamespaces = [
+      {
+        namespaceId: "ns-1",
+        name: "sales-data",
+        status: NamespaceStatus.ACTIVE,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-05-01T00:00:00Z",
+      },
+    ];
+    const formatDate = vi.spyOn(Date.prototype, "toLocaleDateString");
+
+    try {
+      render(<NamespaceList />, { wrapper: localizedWrapper });
+
+      await waitFor(() => {
+        expect(formatDate).toHaveBeenCalledWith("ja");
+      });
+    } finally {
+      formatDate.mockRestore();
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
+  });
+});
+
+describe("NamespaceList language column", () => {
+  beforeEach(() => {
+    mockNamespaces = [
+      { namespaceId: "ns-en", name: "en-ns", status: "ACTIVE", language: "en" },
+      { namespaceId: "ns-ja", name: "ja-ns", status: "ACTIVE", language: "ja" },
+      {
+        namespaceId: "ns-pt",
+        name: "pt-ns",
+        status: "ACTIVE",
+        language: "pt-BR",
+      },
+    ];
+  });
+
+  it("shows each namespace language read-only with a human label", () => {
+    render(<NamespaceList />, { wrapper });
+    expect(
+      screen.getByRole("columnheader", { name: /language/i }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("row", { name: /en-ns/i })).getByText(
+        "English (en)",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("row", { name: /ja-ns/i })).getByText(
+        "Japanese (ja)",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows an unknown language tag as the raw tag", () => {
+    render(<NamespaceList />, { wrapper });
+    expect(
+      within(screen.getByRole("row", { name: /pt-ns/i })).getByText("pt-BR"),
+    ).toBeInTheDocument();
+  });
+
+  it("labels the offered languages in the application locale", async () => {
+    window.localStorage.setItem("scl.locale", "ja");
+    try {
+      render(<NamespaceList />, { wrapper: localizedWrapper });
+      expect(
+        await screen.findByRole("columnheader", { name: /言語/ }),
+      ).toBeInTheDocument();
+      expect(
+        within(screen.getByRole("row", { name: /ja-ns/i })).getByText(
+          "日本語 (ja)",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(screen.getByRole("row", { name: /en-ns/i })).getByText(
+          "英語 (en)",
+        ),
+      ).toBeInTheDocument();
+      // A tag the console did not author is shown as-is in every locale.
+      expect(
+        within(screen.getByRole("row", { name: /pt-ns/i })).getByText("pt-BR"),
+      ).toBeInTheDocument();
+    } finally {
+      window.localStorage.clear();
+      document.documentElement.lang = "";
+    }
   });
 });
 

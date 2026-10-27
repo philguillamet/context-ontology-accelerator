@@ -3,6 +3,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { useBreadcrumbTrail } from "@api-hooks/use-breadcrumb-trail";
+import { useNamespace } from "@api-hooks/use-namespace";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -37,7 +39,7 @@ import {
   type ProposalValidationFinding,
   type ProposalValidationJob,
 } from "../../../services/ontology-engine";
-import { useApiClient } from "@components/ApiClientProvider";
+import { ApiError, useApiClient } from "@components/ApiClientProvider";
 import {
   OntologyGraphFlow,
   type GraphAttribute,
@@ -65,6 +67,7 @@ import { parseTurtleEntities, type TurtleEntity } from "./turtle";
 import { ProposalEntitiesPanel } from "./ProposalEntitiesPanel";
 import { InfoPopover } from "@components/InfoPopover";
 import { ButtonWithHint } from "@components/ButtonWithHint";
+import { useAppI18n } from "../../../i18n/LocaleProvider";
 
 /**
  * Whether the proposal has a COMPUTED ontology to show constraints for.
@@ -192,6 +195,39 @@ function extractInferredClasses(payload: unknown): InferredClass[] {
   );
 }
 
+/**
+ * Turn a failed save into a message that says whether to retry or to fix input.
+ *
+ * The update route distinguishes its failures deliberately: a 503 means the
+ * attempt was abandoned before any write and is safe to repeat, while a 409 or
+ * 400 means the request itself was refused and repeating it unchanged will fail
+ * the same way. Rendering only `error.message` collapsed that distinction, so a
+ * user who hit a transient DynamoDB throttle was told to fix input that was
+ * never wrong. The server's own sentence is always kept — for grounding
+ * overrides it names which class aborted the save.
+ */
+export function describeSaveFailure(error: unknown): string {
+  if (error instanceof ApiError) {
+    switch (error.status) {
+      case 503:
+        return `${error.message} Nothing was saved, so you can retry this save as-is.`;
+      case 409:
+        return `The server refused this save: ${error.message} Retrying unchanged will fail the same way.`;
+      case 400:
+        return `This save was rejected as malformed: ${error.message}`;
+      // 401/403 messages are already written for the reader, and a 5xx other
+      // than 503 carries no retry promise, so neither gets a prefix.
+      default:
+        return error.message;
+    }
+  }
+  // Local guards (the mixed grounding/Turtle check) and presigned-PUT failures
+  // throw ordinary Errors whose messages are already the whole story.
+  return error instanceof Error
+    ? error.message
+    : "Failed to save proposal changes";
+}
+
 const DATATYPE_FINDING_CODE = "MALFORMED_DATATYPE_TOKENS";
 
 function localName(iri: string): string {
@@ -274,20 +310,30 @@ function DatatypeRepairModal({
   onApply: () => void;
   onDismiss: () => void;
 }) {
+  const { t } = useAppI18n();
   const groups = useMemo(() => groupOffenders(offenders), [offenders]);
   return (
     <Modal
       visible={visible}
       onDismiss={onDismiss}
-      header={`Repair ${offenders.length} datatype issue${offenders.length === 1 ? "" : "s"} across ${groups.length} datatype name${groups.length === 1 ? "" : "s"}`}
+      header={t(
+        offenders.length === 1
+          ? groups.length === 1
+            ? "Repair {issues} datatype issue across {names} datatype name"
+            : "Repair {issues} datatype issue across {names} datatype names"
+          : groups.length === 1
+            ? "Repair {issues} datatype issues across {names} datatype name"
+            : "Repair {issues} datatype issues across {names} datatype names",
+        { issues: offenders.length, names: groups.length },
+      )}
       footer={
         <Box float="right">
           <SpaceBetween direction="horizontal" size="xs">
             <Button variant="link" onClick={onDismiss} disabled={repairing}>
-              Cancel
+              {t("Cancel")}
             </Button>
             <Button variant="primary" onClick={onApply} loading={repairing}>
-              Apply repair
+              {t("Apply repair")}
             </Button>
           </SpaceBetween>
         </Box>
@@ -295,17 +341,16 @@ function DatatypeRepairModal({
     >
       <SpaceBetween size="s">
         <Box>
-          These datatype names use non-standard spelling. Applying the repair
-          rewrites them to the correct XSD datatype in your saved proposal. Your
-          queries already work (the served copy is auto-corrected) — repairing
-          keeps the saved ontology consistent with what gets served.
+          {t(
+            "These datatype names use non-standard spelling. Applying the repair rewrites them to the correct XSD datatype in your saved proposal. Your queries already work (the served copy is auto-corrected) — repairing keeps the saved ontology consistent with what gets served.",
+          )}
         </Box>
         <Table
           variant="embedded"
           columnDefinitions={[
             {
               id: "change",
-              header: "Change",
+              header: t("Change"),
               cell: (g: DatatypeFixGroup) => (
                 <span>
                   <code>{localName(g.found)}</code> →{" "}
@@ -315,14 +360,20 @@ function DatatypeRepairModal({
             },
             {
               id: "reason",
-              header: "Reason",
-              cell: (g: DatatypeFixGroup) => g.reason,
+              header: t("Reason"),
+              cell: (g: DatatypeFixGroup) =>
+                g.reason === "non-standard capitalization"
+                  ? t("non-standard capitalization")
+                  : t("not a valid XSD datatype name"),
             },
             {
               id: "affected",
-              header: "Affected",
+              header: t("Affected"),
               cell: (g: DatatypeFixGroup) =>
-                `${g.affected} reference${g.affected === 1 ? "" : "s"}`,
+                t(
+                  g.affected === 1 ? "{count} reference" : "{count} references",
+                  { count: g.affected },
+                ),
             },
           ]}
           items={groups}
@@ -343,20 +394,30 @@ function ValidationResults({
   repairing?: boolean;
   repairDisabledReason?: string;
 }) {
+  const { t } = useAppI18n();
   if (job.status === "pending" || job.status === "running") {
     return (
-      <Alert type="info" header={`Validation ${job.status}…`}>
+      <Alert
+        type="info"
+        header={t("Validation {status}…", {
+          status: job.status,
+        })}
+      >
         <SpaceBetween direction="horizontal" size="xs">
           <Spinner />
-          <Box>Running HermiT reasoner + structural metrics + OoPS!</Box>
+          <Box>
+            {t(
+              "Running HermiT reasoner + structural metrics + OoPS! (if enabled)",
+            )}
+          </Box>
         </SpaceBetween>
       </Alert>
     );
   }
   if (job.status === "failed") {
     return (
-      <Alert type="error" header="Validation failed" dismissible>
-        {job.error ?? "Unknown error"}
+      <Alert type="error" header={t("Validation failed")} dismissible>
+        {job.error ?? t("Unknown error")}
       </Alert>
     );
   }
@@ -372,15 +433,23 @@ function ValidationResults({
       type={report.passed ? "success" : "error"}
       header={
         report.passed
-          ? "Validation passed"
-          : `Validation failed: ${errors.length} error${errors.length === 1 ? "" : "s"}`
+          ? t("Validation passed")
+          : t(
+              errors.length === 1
+                ? "Validation failed: {count} error"
+                : "Validation failed: {count} errors",
+              { count: errors.length },
+            )
       }
     >
       <SpaceBetween size="s">
         <Box>
           <Badge color={report.passed ? "green" : "red"}>
-            {errors.length} error · {warnings.length} warning · {infos.length}{" "}
-            info
+            {t("{errors} error · {warnings} warning · {infos} info", {
+              errors: errors.length,
+              warnings: warnings.length,
+              infos: infos.length,
+            })}
           </Badge>
         </Box>
         {report.metrics && (
@@ -388,19 +457,19 @@ function ValidationResults({
             columns={4}
             items={[
               {
-                label: "Classes",
+                label: t("Classes"),
                 value: String(report.metrics.class_count ?? 0),
               },
               {
-                label: "Object props",
+                label: t("Object props"),
                 value: String(report.metrics.object_property_count ?? 0),
               },
               {
-                label: "Datatype props",
+                label: t("Datatype props"),
                 value: String(report.metrics.datatype_property_count ?? 0),
               },
               {
-                label: "Max depth",
+                label: t("Max depth"),
                 value: String(report.metrics.max_depth ?? 0),
               },
             ]}
@@ -447,7 +516,12 @@ function ValidationResults({
                       disabled={!!repairDisabledReason}
                       onClick={() => onRepair?.(offenders)}
                     >
-                      {`Repair ${offenders.length} datatype issue${offenders.length === 1 ? "" : "s"}`}
+                      {t(
+                        offenders.length === 1
+                          ? "Repair {count} datatype issue"
+                          : "Repair {count} datatype issues",
+                        { count: offenders.length },
+                      )}
                     </Button>
                     {repairDisabledReason && (
                       <Box
@@ -496,6 +570,7 @@ function CodeBlock({ children }: { children: string }) {
 }
 
 export function ProposalDetailPage() {
+  const { t } = useAppI18n();
   const { namespaceId, proposalId } = useParams<{
     namespaceId: string;
     proposalId: string;
@@ -504,9 +579,24 @@ export function ProposalDetailPage() {
   const apiClient = useApiClient();
   const { current: currentNamespace } = useCurrentNamespace();
 
+  const { name: nsName } = useNamespace(namespaceId);
+  useBreadcrumbTrail([
+    { text: nsName, href: `/namespaces/${namespaceId}`, namespaceId },
+    { text: t("Ontology") },
+    {
+      text: t("Induction"),
+      href: `/namespaces/${namespaceId}/ontology`,
+      namespaceId,
+    },
+    { text: proposalId ?? "" },
+  ]);
+
   const [proposal, setProposal] = useState<Proposal | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Save failures are recoverable editing errors. Keep them separate from the
+  // initial-load error, which replaces the page with a retry screen.
+  const [saveError, setSaveError] = useState<string | null>(null);
   // Inline error for the entity-edit panel. Kept separate from `error` so an
   // apply failure surfaces inside the editor rather than replacing the whole
   // page (the page-level `error` triggers a full-page "Could not load proposal").
@@ -550,11 +640,13 @@ export function ProposalDetailPage() {
   // Legacy proposals still carry them inline; refresh() prefers that when present.
   const [groundingMatches, setGroundingMatches] = useState<ConceptMatch[]>([]);
   const [dirty, setDirty] = useState(false);
-  // Staged grounding overrides (table → chosen foundational URI, or ``null``
-  // to keep the table novel) that are NOT yet persisted. Picking a candidate /
-  // marking novel stages here + marks dirty; sent on the next explicit Save
-  // (not auto-committed on every selection). ``null`` clears grounding — the
-  // backend ``grounding_overrides`` contract is ``dict[str, str | None]``.
+  // Staged grounding overrides (stable table identity, with a bare-table
+  // fallback for legacy matches → chosen foundational URI, or ``null`` to keep
+  // the table novel) that are NOT yet persisted. Picking a candidate / marking
+  // novel stages here + marks dirty; sent on the next explicit Save.
+  // The wire contract splits candidate URIs into ``grounding_overrides`` and
+  // clears into ``novel_tables`` so generated OpenAPI clients never need null
+  // map values. The staged UI state keeps the ergonomic nullable form.
   const [pendingGroundingOverrides, setPendingGroundingOverrides] = useState<
     Record<string, string | null>
   >({});
@@ -585,6 +677,7 @@ export function ProposalDetailPage() {
   const refresh = useCallback(() => {
     if (!proposalId || !namespaceId) return;
     setError(null);
+    setSaveError(null);
     setLoading(true);
     getProposal(apiClient, namespaceId, proposalId)
       .then(async (p) => {
@@ -706,7 +799,7 @@ export function ProposalDetailPage() {
         // replace the page. Surface it inline via parseError and clear the
         // now-stale parse results; the editor stays intact.
         setParseError(
-          e instanceof Error ? e.message : "Failed to parse ontology Turtle",
+          e instanceof Error ? e.message : t("Failed to parse ontology Turtle"),
         );
         setTurtleParse(null);
         setGraphData(null);
@@ -715,7 +808,7 @@ export function ProposalDetailPage() {
       }
     }, 0);
     return () => window.clearTimeout(handle);
-  }, [editedTurtle]);
+  }, [editedTurtle, t]);
 
   const flowNodes: GraphNodeData[] = useMemo(() => {
     if (!graphData) return [];
@@ -775,7 +868,9 @@ export function ProposalDetailPage() {
     // later, and keep the editor open so the in-progress value isn't lost.
     if (updated === editedTurtle) {
       setEditError(
-        `Could not apply this edit: the entry's original text was not found in the Turtle (it may have changed since you opened it). Close and re-open the entry, then try again.`,
+        t(
+          "Could not apply this edit: the entry's original text was not found in the Turtle (it may have changed since you opened it). Close and re-open the entry, then try again.",
+        ),
       );
       return;
     }
@@ -785,24 +880,52 @@ export function ProposalDetailPage() {
     setEditingEntity(null);
   }
 
+  const ontologyChanged =
+    editedTurtle != null && editedTurtle !== originalTurtleRef.current;
+  const r2rmlChanged =
+    editedR2rml != null && editedR2rml !== originalR2rmlRef.current;
+  const groundingChanged = Object.keys(pendingGroundingOverrides).length > 0;
+  const hasMixedEdits = groundingChanged && (ontologyChanged || r2rmlChanged);
+
+  function discardGroundingChanges() {
+    setPendingGroundingOverrides({});
+    setDirty(ontologyChanged || r2rmlChanged);
+    setSaveError(null);
+  }
+
+  function discardTurtleChanges() {
+    setEditedTurtle(originalTurtleRef.current);
+    setEditedR2rml(originalR2rmlRef.current);
+    setTurtleDraft(originalTurtleRef.current);
+    setTurtleEditMode(false);
+    setR2rmlEditMode(false);
+    setEditingEntity(null);
+    setEditError(null);
+    setParseError(null);
+    setDirty(groundingChanged);
+    setSaveError(null);
+  }
+
   async function saveChanges() {
     if (!proposalId || !namespaceId || !dirty) return;
+    setSaveError(null);
     setUpdating(true);
     try {
-      const ontologyChanged =
-        editedTurtle != null && editedTurtle !== originalTurtleRef.current;
-      const r2rmlChanged =
-        editedR2rml != null && editedR2rml !== originalR2rmlRef.current;
-      const groundingChanged =
-        Object.keys(pendingGroundingOverrides).length > 0;
       if (!ontologyChanged && !r2rmlChanged && !groundingChanged) {
         setUpdating(false);
         return;
       }
+      if (groundingChanged && (ontologyChanged || r2rmlChanged)) {
+        throw new Error(
+          "Grounding overrides and Turtle edits must be saved separately",
+        );
+      }
       const fields: {
         ontology_uploaded?: boolean;
         r2rml_uploaded?: boolean;
-        grounding_overrides?: Record<string, string | null>;
+        grounding_overrides?: Record<string, string>;
+        novel_tables?: string[];
+        upload_revision_id?: string;
       } = {};
       // Upload edited Turtle straight to S3 via presigned PUT, bypassing the
       // 6 MB API Gateway / Lambda request limit (mirror of the presigned-GET
@@ -815,49 +938,67 @@ export function ProposalDetailPage() {
           namespaceId,
           proposalId,
         );
+        fields.upload_revision_id = urls.revisionId;
         if (ontologyChanged && editedTurtle) {
-          await putToPresignedUrl(urls.ontology_put_url, editedTurtle);
+          await putToPresignedUrl(urls.ontologyPutUrl, editedTurtle);
           fields.ontology_uploaded = true;
         }
         if (r2rmlChanged && editedR2rml) {
-          await putToPresignedUrl(urls.r2rml_put_url, editedR2rml);
+          await putToPresignedUrl(urls.r2rmlPutUrl, editedR2rml);
           fields.r2rml_uploaded = true;
         }
       }
-      // Grounding overrides are small; sent inline alongside the upload flags.
+      // Grounding overrides are small and are sent inline only when no Turtle
+      // artifact changed; the server rejects mixed requests as a second guard.
       if (groundingChanged) {
-        fields.grounding_overrides = pendingGroundingOverrides;
+        const groundingOverrides: Record<string, string> = {};
+        const novelTables: string[] = [];
+        for (const [table, uri] of Object.entries(pendingGroundingOverrides)) {
+          if (uri === null) {
+            novelTables.push(table);
+          } else {
+            groundingOverrides[table] = uri;
+          }
+        }
+        if (Object.keys(groundingOverrides).length > 0) {
+          fields.grounding_overrides = groundingOverrides;
+        }
+        if (novelTables.length > 0) {
+          fields.novel_tables = novelTables;
+        }
       }
       await updateProposal(apiClient, namespaceId, proposalId, fields);
       setDirty(false);
       setPendingGroundingOverrides({});
       refresh();
-    } catch (e) {
-      setError((e as Error).message);
+    } catch (error: unknown) {
+      setSaveError(describeSaveFailure(error));
     } finally {
       setUpdating(false);
     }
   }
 
-  // Stage a chosen grounding candidate for a source table. Memoized so the
+  // Stage a chosen grounding candidate for a stable match key. Memoized so the
   // ProposalEntitiesPanel effect that mounts the split panel doesn't re-run on
   // every render (which would reopen the panel each keystroke). Selections are
   // ignored while a save is in flight — saveChanges → refresh() clears the
   // staged map, so a mid-save selection would be lost.
   const stageGroundingCandidate = useCallback(
-    (table: string, uri: string) => {
+    (matchKey: string, uri: string) => {
       if (updating) return;
-      setPendingGroundingOverrides((prev) => ({ ...prev, [table]: uri }));
+      setPendingGroundingOverrides((prev) => ({ ...prev, [matchKey]: uri }));
       setDirty(true);
+      setSaveError(null);
     },
     [updating],
   );
-  // Stage "keep novel" (null clears grounding — see grounding_overrides type).
+  // Stage "keep novel" (serialized as novel_tables by saveChanges).
   const stageGroundingNovel = useCallback(
-    (table: string) => {
+    (matchKey: string) => {
       if (updating) return;
-      setPendingGroundingOverrides((prev) => ({ ...prev, [table]: null }));
+      setPendingGroundingOverrides((prev) => ({ ...prev, [matchKey]: null }));
       setDirty(true);
+      setSaveError(null);
     },
     [updating],
   );
@@ -901,7 +1042,9 @@ export function ProposalDetailPage() {
     } catch (e) {
       setAcceptResult({
         ok: false,
-        message: `Datatype repair failed: ${(e as Error).message}`,
+        message: t("Datatype repair failed: {error}", {
+          error: (e as Error).message,
+        }),
       });
       return;
     } finally {
@@ -932,7 +1075,9 @@ export function ProposalDetailPage() {
         if (fresh.status === "accepted") {
           setAcceptResult({
             ok: true,
-            message: `Merged into ontology ${fresh.ontology_id}`,
+            message: t("Merged into ontology {id}", {
+              id: fresh.ontology_id,
+            }),
           });
           return;
         }
@@ -945,15 +1090,18 @@ export function ProposalDetailPage() {
             ok: false,
             message:
               fresh.accept_error ??
-              "Accept failed. Re-accept to retry once the cause is resolved.",
+              t(
+                "Accept failed. Re-accept to retry once the cause is resolved.",
+              ),
           });
           return;
         }
       }
       setAcceptResult({
         ok: false,
-        message:
+        message: t(
           "Accept is still in progress after 5 minutes. The ingest may complete in the background — refresh the page to recheck.",
+        ),
       });
     } catch (e) {
       setAcceptResult({ ok: false, message: (e as Error).message });
@@ -1033,7 +1181,9 @@ export function ProposalDetailPage() {
         proposal_id: proposalId,
         status: "failed",
         created_at: new Date().toISOString(),
-        error: `Datatype repair failed: ${(e as Error).message}`,
+        error: t("Datatype repair failed: {error}", {
+          error: (e as Error).message,
+        }),
       });
     } finally {
       setRepairing(false);
@@ -1050,8 +1200,8 @@ export function ProposalDetailPage() {
     return (
       <Alert
         type="error"
-        header="Could not load proposal"
-        action={<Button onClick={refresh}>Retry</Button>}
+        header={t("Could not load proposal")}
+        action={<Button onClick={refresh}>{t("Retry")}</Button>}
       >
         {error}
       </Alert>
@@ -1077,17 +1227,19 @@ export function ProposalDetailPage() {
             variant="h1"
             info={
               <InfoPopover
-                header="Reviewing a proposal"
-                ariaLabel="About proposals"
+                header={t("Reviewing a proposal")}
+                ariaLabel={t("About proposals")}
               >
                 <SpaceBetween size="xs">
                   <Box variant="p">
-                    A proposal is a draft ontology generated from your data
-                    source. It is not live yet.
+                    {t(
+                      "A proposal is a draft ontology generated from your data source. It is not live yet.",
+                    )}
                   </Box>
                   <Box variant="p">
-                    Review and edit the classes, properties, and mappings, then
-                    Accept to merge it into this namespace's ontology.
+                    {t(
+                      "Review and edit the classes, properties, and mappings, then Accept to merge it into this namespace's ontology.",
+                    )}
                   </Box>
                 </SpaceBetween>
               </InfoPopover>
@@ -1103,61 +1255,97 @@ export function ProposalDetailPage() {
                     navigate(`/namespaces/${namespaceId}/ontology`)
                   }
                 >
-                  Back
+                  {t("Back")}
                 </Button>
                 <Button iconName="refresh" onClick={refresh}>
-                  Refresh
+                  {t("Refresh")}
                 </Button>
                 <ButtonWithHint
-                  hint="Saves your edits (Turtle, R2RML, grounding choices) to the draft without accepting it."
+                  hint={t(
+                    "Saves your edits (Turtle, R2RML, grounding choices) to the draft without accepting it.",
+                  )}
                   onClick={saveChanges}
                   loading={updating}
                   disabled={!dirty || isReadOnly}
                 >
-                  Save changes
+                  {t("Save changes")}
                 </ButtonWithHint>
                 <Button
                   onClick={cancel}
                   loading={cancelling}
                   disabled={isReadOnly}
                 >
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <ButtonWithHint
-                  hint="Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!). Doesn't change the proposal."
+                  hint={t(
+                    "Read-only quality checks: reasoner consistency (HermiT), structural metrics, and design pitfalls (OoPS!, if enabled). Doesn't change the proposal.",
+                  )}
                   onClick={validate}
                   loading={validating}
                   disabled={!editedTurtle}
                 >
-                  Validate
+                  {t("Validate")}
                 </ButtonWithHint>
                 <ButtonWithHint
-                  hint="Merges this draft into the namespace's live ontology (graph, search index, storage). Runs in the background; can't be undone here."
+                  hint={t(
+                    "Merges this draft into the namespace's live ontology (graph, search index, storage). Runs in the background; can't be undone here.",
+                  )}
                   variant="primary"
                   onClick={requestAccept}
                   loading={isAccepting || checkingAccept}
                   disabled={isReadOnly || isAccepting || checkingAccept}
                 >
                   {proposal.status === "accepted"
-                    ? "Already accepted"
+                    ? t("Already accepted")
                     : isAccepting
-                      ? "Accepting…"
-                      : "Accept proposal"}
+                      ? t("Accepting…")
+                      : t("Accept proposal")}
                 </ButtonWithHint>
               </SpaceBetween>
             }
           >
-            {(md.label as string) || `Proposal ${proposalId?.slice(0, 8)}…`}
+            {(md.label as string) ||
+              t("Proposal {id}…", { id: proposalId?.slice(0, 8) ?? "" })}
           </Header>
-          {dirty && (
+          {dirty && !hasMixedEdits && (
             <Alert type="info">
-              Unsaved edits. Click <strong>Save changes</strong> to upload.
+              {t("Unsaved edits. Click Save changes to upload.")}
+            </Alert>
+          )}
+          {hasMixedEdits && (
+            <Alert
+              type="warning"
+              header="Choose which edits to save"
+              action={
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Button onClick={discardGroundingChanges}>
+                    Discard grounding choices
+                  </Button>
+                  <Button onClick={discardTurtleChanges}>
+                    Discard Turtle edits
+                  </Button>
+                </SpaceBetween>
+              }
+            >
+              Grounding choices rebuild the ontology, so grounding and Turtle
+              edits must be saved separately.
+            </Alert>
+          )}
+          {saveError && (
+            <Alert
+              type="error"
+              header="Could not save changes"
+              dismissible
+              onDismiss={() => setSaveError(null)}
+            >
+              {saveError}
             </Alert>
           )}
           {acceptResult && (
             <Alert
               type={acceptResult.ok ? "success" : "error"}
-              header={acceptResult.ok ? "Accepted" : "Failed"}
+              header={acceptResult.ok ? t("Accepted") : t("Failed")}
               dismissible
               onDismiss={() => setAcceptResult(null)}
             >
@@ -1175,7 +1363,7 @@ export function ProposalDetailPage() {
             proposal.accept_error && (
               <Alert
                 type="error"
-                header="Previous accept attempt failed"
+                header={t("Previous accept attempt failed")}
                 dismissible
               >
                 <CodeBlock>{proposal.accept_error}</CodeBlock>
@@ -1187,16 +1375,20 @@ export function ProposalDetailPage() {
               type="info"
               header={
                 proposal.status === "embeddings_sync"
-                  ? "Syncing embeddings…"
-                  : "Accepting proposal…"
+                  ? t("Syncing embeddings…")
+                  : t("Accepting proposal…")
               }
             >
               <SpaceBetween direction="horizontal" size="xs">
                 <Spinner />
                 <Box>
                   {proposal.status === "embeddings_sync"
-                    ? "Waiting for embeddings to become searchable in the vector index."
-                    : "Merging into ontology graph (Neptune + AOSS + S3 + embeddings)."}
+                    ? t(
+                        "Waiting for embeddings to become searchable in the vector index.",
+                      )
+                    : t(
+                        "Merging into ontology graph (Neptune + AOSS + S3 + embeddings).",
+                      )}
                 </Box>
               </SpaceBetween>
             </Alert>
@@ -1208,7 +1400,7 @@ export function ProposalDetailPage() {
               onRepair={setRepairOffenders}
               repairing={repairing}
               repairDisabledReason={
-                dirty ? "Save or discard your edits first" : undefined
+                dirty ? t("Save or discard your edits first") : undefined
               }
             />
           )}
@@ -1225,7 +1417,7 @@ export function ProposalDetailPage() {
             <Modal
               visible
               onDismiss={() => setAcceptDatatypeWarning(null)}
-              header="Accept with unrepaired datatype issues?"
+              header={t("Accept with unrepaired datatype issues?")}
               footer={
                 <Box float="right">
                   <SpaceBetween direction="horizontal" size="xs">
@@ -1234,20 +1426,20 @@ export function ProposalDetailPage() {
                       onClick={() => setAcceptDatatypeWarning(null)}
                       disabled={repairing || accepting}
                     >
-                      Cancel
+                      {t("Cancel")}
                     </Button>
                     <Button
                       onClick={doAccept}
                       disabled={repairing || accepting}
                     >
-                      Accept anyway
+                      {t("Accept anyway")}
                     </Button>
                     <Button
                       variant="primary"
                       onClick={repairThenAccept}
                       loading={repairing}
                     >
-                      Repair &amp; accept
+                      {t("Repair & accept")}
                     </Button>
                   </SpaceBetween>
                 </Box>
@@ -1255,20 +1447,19 @@ export function ProposalDetailPage() {
             >
               <SpaceBetween size="s">
                 <Box>
-                  This proposal has {acceptDatatypeWarning.length} datatype
-                  reference
-                  {acceptDatatypeWarning.length === 1 ? "" : "s"} that use
-                  non-standard spelling. If you accept without repairing, they
-                  are stored as-is in your ontology and any downloads (queries
-                  still work — the served copy is auto-corrected). Repairing
-                  first keeps your saved ontology consistent everywhere.
+                  {t(
+                    acceptDatatypeWarning.length === 1
+                      ? "This proposal has {count} datatype reference that uses non-standard spelling. If you accept without repairing, it is stored as-is in your ontology and any downloads (queries still work — the served copy is auto-corrected). Repairing first keeps your saved ontology consistent everywhere."
+                      : "This proposal has {count} datatype references that use non-standard spelling. If you accept without repairing, they are stored as-is in your ontology and any downloads (queries still work — the served copy is auto-corrected). Repairing first keeps your saved ontology consistent everywhere.",
+                    { count: acceptDatatypeWarning.length },
+                  )}
                 </Box>
                 <Table
                   variant="embedded"
                   columnDefinitions={[
                     {
                       id: "change",
-                      header: "Change",
+                      header: t("Change"),
                       cell: (g: DatatypeFixGroup) => (
                         <span>
                           <code>{localName(g.found)}</code> →{" "}
@@ -1278,14 +1469,22 @@ export function ProposalDetailPage() {
                     },
                     {
                       id: "reason",
-                      header: "Reason",
-                      cell: (g: DatatypeFixGroup) => g.reason,
+                      header: t("Reason"),
+                      cell: (g: DatatypeFixGroup) =>
+                        g.reason === "non-standard capitalization"
+                          ? t("non-standard capitalization")
+                          : t("not a valid XSD datatype name"),
                     },
                     {
                       id: "affected",
-                      header: "Affected",
+                      header: t("Affected"),
                       cell: (g: DatatypeFixGroup) =>
-                        `${g.affected} reference${g.affected === 1 ? "" : "s"}`,
+                        t(
+                          g.affected === 1
+                            ? "{count} reference"
+                            : "{count} references",
+                          { count: g.affected },
+                        ),
                     },
                   ]}
                   items={groupOffenders(acceptDatatypeWarning)}
@@ -1297,13 +1496,13 @@ export function ProposalDetailPage() {
           <ExpandableSection
             variant="container"
             defaultExpanded
-            headerText="Summary"
+            headerText={t("Summary")}
           >
             <KeyValuePairs
               columns={3}
               items={[
                 {
-                  label: "Proposal ID",
+                  label: t("Proposal ID"),
                   value: <Box variant="code">{proposal.proposal_id}</Box>,
                 },
                 {
@@ -1313,65 +1512,67 @@ export function ProposalDetailPage() {
                       size="xxs"
                       alignItems="center"
                     >
-                      <span>Status</span>
+                      <span>{t("Status")}</span>
                       <InfoPopover
-                        header="Proposal status"
-                        ariaLabel="About proposal status"
+                        header={t("Proposal status")}
+                        ariaLabel={t("About proposal status")}
                       >
                         <SpaceBetween size="xs">
                           <Box variant="p">
-                            <strong>Pending</strong>: ready to review and edit.
+                            {t("Pending: ready to review and edit.")}
                           </Box>
                           <Box variant="p">
-                            <strong>Accepting / Syncing embeddings</strong>:
-                            merging into the graph and search index (a few
-                            minutes).
+                            {t(
+                              "Accepting / Syncing embeddings: merging into the graph and search index (a few minutes).",
+                            )}
                           </Box>
                           <Box variant="p">
-                            <strong>Accepted</strong>: now part of the live
-                            ontology.
+                            {t("Accepted: now part of the live ontology.")}
                           </Box>
                           <Box variant="p">
-                            <strong>Updated</strong>: edits saved, not yet
-                            accepted.
+                            {t("Updated: edits saved, not yet accepted.")}
                           </Box>
                           <Box variant="p">
-                            <strong>Rejected / Cancelled</strong>: the draft was
-                            discarded.
+                            {t(
+                              "Rejected / Cancelled: the draft was discarded.",
+                            )}
                           </Box>
                         </SpaceBetween>
                       </InfoPopover>
                     </SpaceBetween>
                   ),
-                  value: proposalStatusIndicator(proposal.status),
+                  value: proposalStatusIndicator(proposal.status, t),
                 },
                 {
-                  label: "Type",
+                  label: t("Type"),
                   value:
                     proposal.source_type === "UNSTRUCTURED"
-                      ? "Unstructured Induction"
-                      : "Structured Induction",
+                      ? t("Unstructured Induction")
+                      : t("Structured Induction"),
                 },
                 {
-                  label: "Namespace",
+                  label: t("Namespace"),
                   value:
                     currentNamespace?.displayName ??
                     currentNamespace?.name ??
                     proposal.namespace,
                 },
-                { label: "Created", value: proposal.created_at ?? "—" },
                 {
-                  label: "Datasource(s)",
+                  label: t("Created"),
+                  value: proposal.created_at ?? "—",
+                },
+                {
+                  label: t("Datasource(s)"),
                   value:
                     proposal.source_type === "UNSTRUCTURED"
-                      ? "Lexical Graph"
+                      ? t("Lexical Graph")
                       : ((md.datasource_ids as string[]) ?? []).join(", ") ||
                         "—",
                 },
                 ...(proposal.source_type !== "UNSTRUCTURED"
                   ? [
                       {
-                        label: "Tables / columns",
+                        label: t("Tables / columns"),
                         value: `${md.tables_processed ?? "?"} / ${md.columns_processed ?? "?"}`,
                       },
                     ]
@@ -1379,27 +1580,28 @@ export function ProposalDetailPage() {
                 {
                   label:
                     proposal.source_type === "UNSTRUCTURED" ? (
-                      "Classes"
+                      t("Classes")
                     ) : (
                       <SpaceBetween
                         direction="horizontal"
                         size="xxs"
                         alignItems="center"
                       >
-                        <span>Novel classes</span>
+                        <span>{t("Novel classes")}</span>
                         <InfoPopover
-                          header="Novel vs grounded"
-                          ariaLabel="About novel classes"
+                          header={t("Novel vs grounded")}
+                          ariaLabel={t("About novel classes")}
                         >
                           <SpaceBetween size="xs">
                             <Box variant="p">
-                              New concepts created because they didn't match any
-                              grounding target.
+                              {t(
+                                "New concepts created because they didn't match any grounding target.",
+                              )}
                             </Box>
                             <Box variant="p">
-                              Classes that did match are reused (grounded) and
-                              not counted here. The graph colors grounded and
-                              novel classes differently.
+                              {t(
+                                "Classes that did match are reused (grounded) and not counted here. The graph colors grounded and novel classes differently.",
+                              )}
                             </Box>
                           </SpaceBetween>
                         </InfoPopover>
@@ -1424,8 +1626,8 @@ export function ProposalDetailPage() {
                   <Spinner size="big" />
                   <span>
                     {loading
-                      ? "Loading ontology from storage…"
-                      : "Rendering ontology…"}
+                      ? t("Loading ontology from storage…")
+                      : t("Rendering ontology…")}
                   </span>
                 </SpaceBetween>
               </Box>
@@ -1437,28 +1639,36 @@ export function ProposalDetailPage() {
               type="warning"
               dismissible
               onDismiss={() => setParseError(null)}
-              header="Ontology Turtle isn't valid"
+              header={t("Ontology Turtle isn't valid")}
             >
-              {parseError} The class list and graph won't update until the
-              Turtle parses cleanly.
+              {t(
+                "{error} The class list and graph won't update until the Turtle parses cleanly.",
+                { error: parseError },
+              )}
             </Alert>
           )}
           {flowNodes.length > 0 && (
             <ExpandableSection
               variant="container"
               defaultExpanded
-              headerText="Proposal graph"
+              headerText={t("Proposal graph")}
               headerDescription={
                 classCount > MAX_GRAPH_CLASSES
                   ? undefined
-                  : "Each cluster is a group of related classes; dashed purple arrows show subclass relationships. Click a class to inspect it, zoom in to read relationship names."
+                  : t(
+                      "Each cluster is a group of related classes; dashed purple arrows show subclass relationships. Click a class to inspect it, zoom in to read relationship names.",
+                    )
               }
             >
               {classCount > MAX_GRAPH_CLASSES ? (
                 <Alert type="info">
-                  This proposal has {classCount} classes — too large to render
-                  as a graph (hidden above {MAX_GRAPH_CLASSES} for performance).
-                  Use the table and Turtle editor below to review and edit.
+                  {t(
+                    "This proposal has {count} classes — too large to render as a graph (hidden above {maximum} for performance). Use the table and Turtle editor below to review and edit.",
+                    {
+                      count: classCount,
+                      maximum: MAX_GRAPH_CLASSES,
+                    },
+                  )}
                 </Alert>
               ) : (
                 <div style={{ height: 560, position: "relative" }}>
@@ -1479,7 +1689,7 @@ export function ProposalDetailPage() {
               ProposalEntitiesPanel into ClassDetailPanel. */}
           {updating && groundingMatches.length > 0 && (
             <Box variant="small" color="text-status-info">
-              Rebuilding ontology with updated grounding...
+              {t("Rebuilding ontology with updated grounding...")}
             </Box>
           )}
 
@@ -1511,16 +1721,16 @@ export function ProposalDetailPage() {
           {editedR2rml && (
             <ExpandableSection
               variant="container"
-              headerText="R2RML Mapping"
+              headerText={t("R2RML Mapping")}
               headerInfo={
                 <InfoPopover
-                  header="R2RML mapping"
-                  ariaLabel="About R2RML mapping"
+                  header={t("R2RML mapping")}
+                  ariaLabel={t("About R2RML mapping")}
                 >
                   <Box variant="p">
-                    Maps each class and property back to its SQL table and
-                    columns, so questions about this ontology can be answered by
-                    querying the source database.
+                    {t(
+                      "Maps each class and property back to its SQL table and columns, so questions about this ontology can be answered by querying the source database.",
+                    )}
                   </Box>
                 </InfoPopover>
               }
@@ -1531,7 +1741,7 @@ export function ProposalDetailPage() {
                     variant="inline-link"
                     onClick={() => setR2rmlEditMode((m) => !m)}
                   >
-                    {r2rmlEditMode ? "View" : "Edit"}
+                    {r2rmlEditMode ? t("View") : t("Edit")}
                   </Button>
                 )
               }
@@ -1545,7 +1755,7 @@ export function ProposalDetailPage() {
                   }}
                   rows={20}
                   disabled={isReadOnly}
-                  ariaLabel="R2RML Turtle"
+                  ariaLabel={t("R2RML Turtle")}
                 />
               ) : (
                 <TurtleHighlight>{editedR2rml}</TurtleHighlight>
@@ -1556,7 +1766,7 @@ export function ProposalDetailPage() {
           {editedTurtle && (
             <ExpandableSection
               variant="container"
-              headerText="Ontology Source (Turtle)"
+              headerText={t("Ontology Source (Turtle)")}
               defaultExpanded={false}
               headerActions={
                 !isReadOnly && (
@@ -1572,7 +1782,7 @@ export function ProposalDetailPage() {
                       }
                     }}
                   >
-                    {turtleEditMode ? "View" : "Edit"}
+                    {turtleEditMode ? t("View") : t("Edit")}
                   </Button>
                 )
               }
@@ -1584,7 +1794,7 @@ export function ProposalDetailPage() {
                     onChange={({ detail }) => setTurtleDraft(detail.value)}
                     rows={25}
                     disabled={isReadOnly}
-                    ariaLabel="Ontology Turtle"
+                    ariaLabel={t("Ontology Turtle")}
                   />
                   <SpaceBetween direction="horizontal" size="xs">
                     <Button
@@ -1593,7 +1803,7 @@ export function ProposalDetailPage() {
                         setTurtleDraft(null);
                       }}
                     >
-                      Cancel
+                      {t("Cancel")}
                     </Button>
                     <Button
                       variant="primary"
@@ -1607,7 +1817,7 @@ export function ProposalDetailPage() {
                         setTurtleDraft(null);
                       }}
                     >
-                      Apply
+                      {t("Apply")}
                     </Button>
                   </SpaceBetween>
                 </SpaceBetween>
@@ -1660,11 +1870,13 @@ export function ProposalDetailPage() {
                     );
                   }
                   if (job.status === "failed") {
-                    throw new Error(job.error || "Constraint inference failed");
+                    throw new Error(
+                      job.error || t("Constraint inference failed"),
+                    );
                   }
                   if (job.status !== "completed") {
                     throw new Error(
-                      "Constraint inference timed out. Try again.",
+                      t("Constraint inference timed out. Try again."),
                     );
                   }
                   const inferred = extractInferredClasses(
@@ -1778,7 +1990,9 @@ export function ProposalDetailPage() {
         >
           <Container
             header={
-              <Header variant="h3">Edit: {editingEntity.entity.subject}</Header>
+              <Header variant="h3">
+                {t("Edit: {name}", { name: editingEntity.entity.subject })}
+              </Header>
             }
           >
             <SpaceBetween size="m">
@@ -1798,12 +2012,16 @@ export function ProposalDetailPage() {
                 value={editValue}
                 onChange={({ detail }) => setEditValue(detail.value)}
                 rows={20}
-                ariaLabel={`Edit Turtle for ${editingEntity.entity.subject}`}
+                ariaLabel={t("Edit Turtle for {name}", {
+                  name: editingEntity.entity.subject,
+                })}
               />
               <SpaceBetween direction="horizontal" size="xs">
-                <Button onClick={() => setEditingEntity(null)}>Cancel</Button>
+                <Button onClick={() => setEditingEntity(null)}>
+                  {t("Cancel")}
+                </Button>
                 <Button variant="primary" onClick={applyEdit}>
-                  Apply
+                  {t("Apply")}
                 </Button>
               </SpaceBetween>
             </SpaceBetween>

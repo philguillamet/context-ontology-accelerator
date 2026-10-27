@@ -47,6 +47,8 @@ from coa_common.constants import (
 )
 from coa_common.dao import DynamoDBDAO
 from coa_common.dao.base import QueryParams
+from coa_common.idempotency import idempotent_create
+from coa_common.language_tags import LanguageTagError
 from coa_common.logging import setup_logging
 from coa_common.response import api_response, iso_to_epoch
 from coa_control_plane_server.models.create_source_input import CreateSourceInput
@@ -59,6 +61,7 @@ from coa_control_plane_server.models.source_summary import SourceSummary
 from coa_control_plane_server.models.source_type import SourceType
 from pydantic import ValidationError
 
+from coa_sources.client_errors import redact
 from coa_sources.database.connectors.athena_catalog import (
     AthenaCatalogError,
     catalog_source_id,
@@ -74,13 +77,20 @@ from coa_sources.database.databricks import (
     delete_config_parameter,
 )
 from coa_sources.database.glue_ownership import release_platform_catalog
+from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
 from coa_sources.database.sub_types import (
     CONNECTOR_BACKED_SUB_TYPES,
     FEDERATED_TEARDOWN_SUB_TYPES,
     PLATFORM_CATALOG_CLAIM_SUB_TYPES,
 )
+from coa_sources.namespace_language import (
+    NamespaceNotFoundError,
+    namespace_language_from_item,
+    resolve_namespace_language,
+)
 from coa_sources.utils import merge_extraction_config
 
+from .contract import LIST_SOURCES_MAX_RESULTS, body_bound_error, label_bound_error, pagination_token_error
 from .namespace_counters import adjust_namespace_source_count
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -129,7 +139,7 @@ except (ValueError, TypeError):
     _EVENT_RESCAN_COOLDOWN_S = 300
 
 _DEFAULT_MAX_RESULTS = 100
-_MAX_RESULTS_LIMIT = 100
+_MAX_RESULTS_LIMIT = LIST_SOURCES_MAX_RESULTS
 _MAX_UPLOAD_FILES = 100
 _MAX_REVIEW_TABLES = 500
 _UPLOAD_URL_EXPIRY_SECONDS = 900
@@ -309,6 +319,42 @@ def _within_event_cooldown(item: dict[str, Any]) -> bool:
     return (datetime.now(UTC) - last_dt).total_seconds() < _EVENT_RESCAN_COOLDOWN_S
 
 
+# Source-row attribute the re-scan trigger writes when it takes the scan lock:
+# the status the source was in before the scan it is starting, carried unchanged
+# through retries from SCAN_FAILED. See ``_rescan_origin``.
+_PRE_SCAN_STATUS_FIELD = "preScanStatus"
+
+
+def _rescan_origin(item: dict[str, Any]) -> str:
+    """Status a database source was in before the scans now being retried began.
+
+    For any status but SCAN_FAILED that is the current status. SCAN_FAILED alone
+    does not say what failed: a failed first scan leaves nothing curated, but a
+    failed re-scan of an approved source leaves its curated assets live, and
+    retrying that one as a first scan revises every asset with fresh, uncurated
+    metadata. So a SCAN_FAILED source answers with the origin the failed
+    run recorded, and a run that retries a SCAN_FAILED source records that same
+    origin again, so a chain of failed retries keeps it.
+
+    A row that failed before the origin was recorded falls back to
+    ``tablesApproved``. Only steward approvals raise it, a failed discovery leaves
+    it as it was, and a first scan starts it at 0, so a count above zero means a
+    re-scan of an approved source is what failed. That row cannot tell whether
+    the failed re-scan started from an open review, so it is treated as APPROVED.
+    """
+    status = str(item.get("status", ""))
+    if status != SourceStatus.SCAN_FAILED:
+        return status
+    recorded = item.get(_PRE_SCAN_STATUS_FIELD)
+    if recorded:
+        return str(recorded)
+    try:
+        tables_approved = int(item.get("tablesApproved") or 0)
+    except (TypeError, ValueError):
+        tables_approved = 0
+    return SourceStatus.APPROVED if tables_approved > 0 else SourceStatus.SCAN_FAILED
+
+
 def _source_id_from_item(item: dict[str, Any]) -> str:
     sk = item.get("SK", "")
     return sk.removeprefix("SRC#") if sk.startswith("SRC#") else sk
@@ -453,9 +499,12 @@ def _build_document_detail(item: dict[str, Any], metrics: dict[str, Any] | None 
     #   1. A plain string (e.g. from sources_handler itself)
     #   2. A Lambda error envelope: {"errorMessage": "...", "errorType": "..."}
     #   3. A raw ECS task JSON blob with "StoppedReason" and "Containers[].Reason"
+    # The Step Functions failure path stores the failing Lambda's raw error
+    # cause here, so redact what is returned: no ARNs, account ids, endpoints or
+    # tracebacks reach the caller (rows written before this change included).
     raw_error = item.get("errorMessage")
     if raw_error:
-        doc["errorMessage"] = _parse_error_message(raw_error)
+        doc["errorMessage"] = redact(_parse_error_message(raw_error))
 
     if item.get("preprocessingIssues"):
         val = item["preprocessingIssues"]
@@ -589,11 +638,18 @@ def _handle_list(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
         return api_response(400, {"error": "maxResults must be a valid integer"})
 
     next_token: str | None = qs.get("nextToken")
+    token_error = pagination_token_error(next_token)
+    if token_error:
+        return api_response(400, {"error": token_error})
     exclusive_start_key: dict[str, Any] | None = None
     if next_token:
         try:
             exclusive_start_key = json.loads(base64.b64decode(next_token).decode())
         except Exception:
+            return api_response(400, {"error": "Invalid nextToken"})
+        # A token minted for another namespace (or hand-edited) would otherwise
+        # reach DynamoDB as an out-of-partition start key and fail as a 500.
+        if not isinstance(exclusive_start_key, dict) or exclusive_start_key.get("namespaceId") != namespace_id:
             return api_response(400, {"error": "Invalid nextToken"})
 
     try:
@@ -621,7 +677,9 @@ def _handle_list(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
                     scan_forward=False,
                 )
             )
-    except ClientError:
+    except ClientError as exc:
+        if exclusive_start_key and exc.response.get("Error", {}).get("Code") == "ValidationException":
+            return api_response(400, {"error": "Invalid nextToken"})
         logger.exception("ddb_query_failed", namespace_id=namespace_id)
         return api_response(500, {"error": "Internal server error"})
 
@@ -662,19 +720,22 @@ def _handle_create(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
     except ValidationError as exc:
         return api_response(400, {"error": _validation_message(exc)})
 
-    # Verify namespace exists
+    # Verify namespace exists and resolve its language. The language is the
+    # namespace's, never the request's: the snapshot taken here travels in the
+    # scan/ingestion job input so the workers need not (and must not) re-read it.
     ns_item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not ns_item:
         return api_response(404, {"error": f"Namespace not found: {namespace_id}"})
+    namespace_language = namespace_language_from_item(ns_item, namespace_id)
 
     if req.source_type == SourceType.DATABASE:
         if not req.database_source:
             return api_response(400, {"error": "databaseSource is required when sourceType=DATABASE"})
-        return _create_database_source(req.database_source, namespace_id)
+        return _create_database_source(req.database_source, namespace_id, namespace_language=namespace_language)
     else:
         if not req.document_source:
             return api_response(400, {"error": "documentSource is required when sourceType=DOCUMENTS"})
-        return _create_document_source(req.document_source, namespace_id, event)
+        return _create_document_source(req.document_source, namespace_id, event, namespace_language=namespace_language)
 
 
 # ---------------------------------------------------------------------------
@@ -1473,6 +1534,17 @@ def _handle_rescan(
     if not item:
         return api_response(404, {"error": f"Source '{source_id}' not found"})
 
+    # Snapshot the namespace language for this job before anything is written.
+    # A missing namespace or a failed read fails the re-scan; it never falls
+    # back to English, and nothing in the request can choose the value.
+    try:
+        namespace_language = resolve_namespace_language(_get_ns_dao(), namespace_id)
+    except NamespaceNotFoundError:
+        return api_response(404, {"error": f"Namespace not found: {namespace_id}"})
+    except (ClientError, BotoCoreError, LanguageTagError):
+        logger.exception("namespace_language_resolve_failed", namespace_id=namespace_id, source_id=source_id)
+        return api_response(500, {"error": "Internal server error"})
+
     source_type = item.get("sourceType", "")
     current_status = item.get("status", "")
     now = _now_iso()
@@ -1509,8 +1581,9 @@ def _handle_rescan(
     # overwrites that blob, so every review decision and edit made inside the
     # open window is dropped — see the merge path in
     # ``pipeline/discovery_handler.py``. Every other allowed status discards
-    # nothing: from APPROVED the live assets already ARE the baseline, and
-    # SCAN_FAILED has no review to lose. Checked before any write below, so a
+    # nothing: from APPROVED the live assets already ARE the baseline, and a
+    # SCAN_FAILED source has no open review (a retry of a failed re-scan keeps
+    # the merge path, see ``_rescan_origin``). Checked before any write below, so a
     # refused call leaves the source exactly as it was.
     if (
         source_type == SourceType.DATABASE
@@ -1535,11 +1608,23 @@ def _handle_rescan(
 
     # A re-scan of an already-approved (or previously drift-reviewed) source is
     # non-destructive: discovery merges onto the live assets and enrichment
-    # regenerates only PENDING items. The scan-failed recovery path is a first
-    # scan, so isRescan stays false there.
-    is_rescan = source_type == SourceType.DATABASE and current_status in (
+    # regenerates only PENDING items. A SCAN_FAILED source takes the same path
+    # when what failed was such a re-scan, and runs as a first scan only when
+    # what failed was a first scan.
+    scan_origin = _rescan_origin(item) if source_type == SourceType.DATABASE else current_status
+    is_rescan = source_type == SourceType.DATABASE and scan_origin in (
         SourceStatus.APPROVED,
         SourceStatus.RESCAN_REVIEW,
+    )
+    # Whether discovery must rebuild the approved baseline from the backup blob
+    # because the live assets are an unreviewed merge: a prior re-scan is still
+    # open in RESCAN_REVIEW, or the re-scan being retried had already written its
+    # backup when it failed (discovery records that on the row before it merges).
+    # A re-scan from APPROVED never reads the blob, so a leftover one is ignored.
+    had_open_rescan = scan_origin == SourceStatus.RESCAN_REVIEW or (
+        current_status == SourceStatus.SCAN_FAILED
+        and scan_origin == SourceStatus.APPROVED
+        and bool(item.get(BACKUP_SCAN_JOB_FIELD))
     )
 
     if source_type == SourceType.DOCUMENTS:
@@ -1592,6 +1677,7 @@ def _handle_rescan(
             "source_type": item.get("docSourceType", "s3"),
             "s3_prefixes": item.get("s3Prefixes", []),
             "extraction_config": extraction_config,
+            "namespace_language": namespace_language,
         }
         if item.get("sourceBucketArn"):
             sqs_body["source_bucket_arn"] = item["sourceBucketArn"]
@@ -1628,10 +1714,17 @@ def _handle_rescan(
         # clear it and only this decides the winner. Writing the scan-job row first
         # would leave the loser's row IN_PROGRESS for good, since it never enqueues
         # and the reaper only reconciles sources that started a state machine.
+        #
+        # The same write records where this scan started, so a retry after it fails
+        # knows whether it is retrying a first scan or a re-scan (``_rescan_origin``).
+        # A re-scan starting from APPROVED also drops the backup marker: the live
+        # assets are the approved baseline then, so a blob from an earlier re-scan
+        # is stale and a retry of THIS run must not read it.
         try:
             _get_dao().update(
                 {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
-                {"status": SourceStatus.SCANNING, "updatedAt": now},
+                {"status": SourceStatus.SCANNING, "updatedAt": now, _PRE_SCAN_STATUS_FIELD: scan_origin},
+                remove_fields=[BACKUP_SCAN_JOB_FIELD] if current_status == SourceStatus.APPROVED else None,
                 condition="#st = :prev",
                 condition_names={"#st": "status"},
                 condition_values={":prev": current_status},
@@ -1669,6 +1762,7 @@ def _handle_rescan(
                     "SK": scan_job_sk,
                     "sourceId": source_id,
                     "namespaceId": namespace_id,
+                    "namespaceLanguage": namespace_language,
                     "status": "IN_PROGRESS",
                     "scanType": "full",
                     "triggerType": trigger,
@@ -1686,26 +1780,31 @@ def _handle_rescan(
                 QueueUrl=_SCAN_QUEUE_URL,
                 MessageBody=json.dumps(
                     {
+                        # The trigger derives the bare sourceId from this for the
+                        # execution input, where the state machine's SCAN_FAILED step
+                        # and the reaper key the sources row on it.
                         "datasourceId": f"DS#{source_id}",
                         "scanJobId": f"SCAN#{str(uuid.uuid4())}",
                         "scanJobPK": f"SRC#{source_id}",
                         "scanJobSK": scan_job_sk,
                         "namespaceId": namespace_id,
+                        "namespaceLanguage": namespace_language,
                         "scanType": "full",
-                        # Set only when re-scanning an already-approved (or drift-
-                        # review) source. Drives the merge-onto-live-assets path in
-                        # discovery and RESCAN_REVIEW routing in enrichment.
+                        # Set when re-scanning an already-approved (or drift-review)
+                        # source, including a retry of such a re-scan that failed.
+                        # Drives the merge-onto-live-assets path in discovery and
+                        # RESCAN_REVIEW routing in enrichment.
                         "isRescan": is_rescan,
-                        # True ONLY when the source was already in RESCAN_REVIEW,
-                        # i.e. a prior re-scan is still open and un-approved. Only
-                        # then are the live assets an interim merge and the S3
-                        # backup blob the approved pre-image discovery must
-                        # reconstruct from. When re-scanning from APPROVED the live
-                        # assets ARE the approved baseline; a leftover backup blob
-                        # (from before delete-on-resolve shipped, or a paged-approve
-                        # gap) is stale and must be ignored. Blob presence alone is
-                        # NOT proof of an open review — this flag is.
-                        "hadOpenRescan": current_status == SourceStatus.RESCAN_REVIEW,
+                        # True ONLY when the live assets are an interim, un-approved
+                        # merge: the source was already in RESCAN_REVIEW, or the
+                        # failed re-scan being retried had written its backup. Only
+                        # then is the S3 backup blob the approved pre-image discovery
+                        # must reconstruct from. When re-scanning from APPROVED the
+                        # live assets ARE the approved baseline; a leftover backup
+                        # blob (from before delete-on-resolve shipped, or a paged-
+                        # approve gap) is stale and must be ignored. Blob presence
+                        # alone is NOT proof of an open review — this flag is.
+                        "hadOpenRescan": had_open_rescan,
                     }
                 ),
             )
@@ -1763,13 +1862,50 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         return api_response(500, {"error": "Internal server error"})
 
 
+# Source-row attribute holding each automated trigger's on/off switch. MANUAL is
+# absent on purpose: a steward can always re-scan through the API.
+_AUTOMATED_RESCAN_SWITCH: dict[str, str] = {
+    ScanTrigger.SCHEDULED: "rescanSchedule",
+    ScanTrigger.EVENT: "eventRescan",
+}
+
+
+def _automated_rescan_skip_reason(namespace_id: str, source_id: str, trigger: str) -> str | None:
+    """Why an automated re-scan must not start, or None when it may.
+
+    Reads the source row and checks the switch for ``trigger``. Turning a
+    trigger off deletes its schedule or rule, but a delivery already in flight,
+    a schedule or rule that survived a failed delete, or a direct invocation
+    still reaches the consumers, so the record is the authority. Kept out of
+    ``_handle_rescan`` so a manual re-scan works with automation off.
+
+    Raises:
+        ClientError: when the source row cannot be read; the caller decides
+            whether that is retried.
+    """
+    switch = _AUTOMATED_RESCAN_SWITCH.get(trigger)
+    if switch is None:
+        return "not_an_automated_trigger"
+    item = _get_dao().get({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+    if not item:
+        return "source_not_found"
+    if item.get("sourceType") != SourceType.DATABASE:
+        return "not_a_database_source"
+    config = item.get(switch)
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return f"{switch}_disabled"
+    return None
+
+
 def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
     """Handle an EventBridge Scheduler invocation: fire a SCHEDULED rescan.
 
     The schedule payload carries the namespace and source ids. This reuses the
     same rescan path as the API (bookkeeping, status transition, enqueue) with
     the trigger stamped SCHEDULED. A rejected rescan (e.g. an active scan) is
-    logged and swallowed — the next scheduled tick will retry.
+    logged and swallowed — the next scheduled tick will retry. A tick for a
+    source whose ``rescanSchedule`` is not enabled, or that is not a database
+    source, is skipped the same way without starting a scan.
 
     Raises:
         ValueError: when the payload carries no ids, which means the schedule
@@ -1782,6 +1918,23 @@ def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
     if not namespace_id or not source_id:
         logger.error("scheduled_rescan_missing_ids", event_keys=sorted(event.keys()))
         raise ValueError("scheduled rescan payload requires namespaceId and sourceId")
+
+    try:
+        skip_reason = _automated_rescan_skip_reason(namespace_id, source_id, ScanTrigger.SCHEDULED)
+    except ClientError:
+        logger.exception("ddb_get_failed", source_id=source_id)
+        return {"ok": False, "statusCode": 500}
+    if skip_reason:
+        # Returned, not raised: a schedule that outlived its OFF switch would
+        # otherwise run Scheduler's full retry policy on every tick. The warning
+        # is what makes such a schedule visible.
+        logger.warning(
+            "scheduled_rescan_skipped",
+            namespace_id=namespace_id,
+            source_id=source_id,
+            reason=skip_reason,
+        )
+        return {"ok": False, "skipped": skip_reason}
 
     logger.info("scheduled_rescan_triggered", namespace_id=namespace_id, source_id=source_id)
     # Empty event so confirmDiscardOpenReview stays false: a scheduled tick must
@@ -1796,6 +1949,28 @@ def _handle_scheduled_rescan(event: dict[str, Any]) -> dict[str, Any]:
             status_code=status_code,
         )
     return {"ok": status_code in (200, 202), "statusCode": status_code}
+
+
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+
+def _body_bound_error(event: dict[str, Any], http_method: str, resource: str) -> str | None:
+    """Shape or upper-bound violation in the JSON body, or None (unparseable bodies are the handler's to report).
+
+    Every request body in the contract is a JSON object. A body that parses to
+    anything else (``null``, a list, a string, a number) is rejected here, once,
+    rather than reaching a handler that calls ``.get`` on it and fails as a 500.
+    """
+    raw = event.get("body")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        body = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if http_method in _BODY_METHODS and not isinstance(body, dict):
+        return "Request body must be a JSON object"
+    return body_bound_error(http_method, resource, body)
 
 
 def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
@@ -1836,11 +2011,26 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         except ValueError as exc:
             return api_response(400, {"error": str(exc)})
 
+    # Declared bounds the handlers below do not check themselves: path-label
+    # lengths and the upper bounds of each body's members (see .contract).
+    bound_error = label_bound_error(http_method, resource, path_params) or _body_bound_error(
+        event, http_method, resource
+    )
+    if bound_error:
+        return api_response(400, {"error": bound_error})
+
     if resource == "/namespaces/{namespaceId}/sources":
         if http_method == "GET":
             return _handle_list(event, namespace_id)
         if http_method == "POST":
-            return _handle_create(event, namespace_id)
+            # Retry-safe with a body ``clientToken``: a retried database create
+            # would otherwise register a duplicate source and enqueue a second scan.
+            return idempotent_create(
+                event,
+                lambda ev: _handle_create(ev, namespace_id),
+                operation="CreateSource",
+                error_field="error",
+            )
 
     if resource == "/namespaces/{namespaceId}/sources/upload-urls" and http_method == "POST":
         return _handle_upload_urls(event, namespace_id)
@@ -1858,7 +2048,14 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         source_id = path_params.get("sourceId", "")
         if not source_id:
             return api_response(400, {"error": "sourceId is required"})
-        return _handle_rescan(event, namespace_id, source_id)
+        # Retry-safe with a body ``clientToken``: a retried rescan would otherwise
+        # get 409 (active scan) instead of its original 202.
+        return idempotent_create(
+            event,
+            lambda ev: _handle_rescan(ev, namespace_id, source_id),
+            operation="RescanSource",
+            error_field="error",
+        )
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/approve" and http_method == "POST":
         source_id = path_params.get("sourceId", "")
@@ -1939,7 +2136,7 @@ def _route(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         source_id = path_params.get("sourceId", "")
         if not source_id:
             return api_response(400, {"error": "sourceId is required"})
-        return _handle_list_scan_jobs(namespace_id, source_id)
+        return _handle_list_scan_jobs(event, namespace_id, source_id)
 
     if resource == "/namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}" and http_method == "GET":
         source_id = path_params.get("sourceId", "")

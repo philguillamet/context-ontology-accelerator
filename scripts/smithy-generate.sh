@@ -13,6 +13,10 @@ GENERATED_DIR="$REPO_ROOT/smithy-generated"
 # openapi-generator version for Python server models
 OPENAPI_GENERATOR_VERSION="7.12.0"
 
+# Fingerprint the inputs BEFORE generating: the stamp written at the end then
+# describes exactly what this run read, even if a model is edited mid-run.
+INPUTS_HASH="$("$REPO_ROOT/scripts/smithy-fingerprint.sh" hash "$REPO_ROOT")"
+
 # ── Clean previous generated output ──────────────────────────────────────────
 echo ""
 echo "Cleaning previous generated output..."
@@ -62,8 +66,7 @@ for client_dir in "$GENERATED_DIR/control-plane-typescript-client" "$GENERATED_D
     # Replace yarn: parallel syntax with sequential npm run calls
     sed -i.bak 's|"build": "concurrently.*"|"build": "npm run build:cjs \&\& npm run build:es \&\& npm run build:types"|' "$client_dir/package.json"
     rm -f "$client_dir/package.json.bak"
-    (cd "$client_dir" && npm install --loglevel=error && npm run build --loglevel=error)
-    if [ $? -ne 0 ]; then
+    if ! (cd "$client_dir" && npm install --loglevel=error && npm run build --loglevel=error); then
         echo "✗ Failed to build TypeScript client: $client_dir"
         exit 1
     fi
@@ -94,6 +97,39 @@ echo "✓ OpenAPI specs copied"
 echo ""
 echo "Generating Python server models from OpenAPI..."
 
+# Smithy renders @sensitive strings as `format: password`, which openapi-generator
+# turns into pydantic SecretStr. That would mask the value ("**********") when a
+# handler serializes a response, so the Python models are generated from a copy
+# of each spec with that format removed. @sensitive is a client-side logging
+# concern; the published specs and the TypeScript clients keep it.
+PYTHON_CODEGEN_SPEC_DIR="$GENERATED_DIR/openapi/python-codegen"
+strip_password_format() {
+    mkdir -p "$PYTHON_CODEGEN_SPEC_DIR"
+    python3 - "$1" "$PYTHON_CODEGEN_SPEC_DIR/$(basename "$1")" <<'PY'
+import json
+import sys
+
+
+def strip(node):
+    if isinstance(node, dict):
+        if node.get("format") == "password":
+            del node["format"]
+        for value in node.values():
+            strip(value)
+    elif isinstance(node, list):
+        for value in node:
+            strip(value)
+
+
+with open(sys.argv[1]) as src:
+    spec = json.load(src)
+strip(spec)
+with open(sys.argv[2], "w") as dst:
+    json.dump(spec, dst, indent=4)
+PY
+    echo "$PYTHON_CODEGEN_SPEC_DIR/$(basename "$1")"
+}
+
 OPENAPI_GEN_JAR="${OPENAPI_GENERATOR_HOME:-$HOME/.local/share/openapi-generator}/openapi-generator-cli-${OPENAPI_GENERATOR_VERSION}.jar"
 if [ ! -f "$OPENAPI_GEN_JAR" ]; then
     echo "Downloading openapi-generator-cli ${OPENAPI_GENERATOR_VERSION}..."
@@ -113,7 +149,7 @@ if [ ! -f "$CONTROL_PLANE_SPEC" ]; then
 fi
 
 java -jar "$OPENAPI_GEN_JAR" generate \
-    -i "$CONTROL_PLANE_SPEC" \
+    -i "$(strip_password_format "$CONTROL_PLANE_SPEC")" \
     -g python \
     -o "$GENERATED_DIR/control-plane-python-server" \
     --package-name coa_control_plane_server \
@@ -162,7 +198,7 @@ if [ ! -f "$DATA_LAYER_SPEC" ]; then
 fi
 
 java -jar "$OPENAPI_GEN_JAR" generate \
-    -i "$DATA_LAYER_SPEC" \
+    -i "$(strip_password_format "$DATA_LAYER_SPEC")" \
     -g python \
     -o "$GENERATED_DIR/data-layer-python-server" \
     --package-name coa_data_layer_server \
@@ -206,6 +242,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["coa_data_layer_server"]
 PYPROJECT
+
+# ── Record what was generated from ───────────────────────────────────────────
+# Last step on purpose: with `set -e`, any failure above exits before this, so a
+# partial generation is never stamped as current and the next deploy re-runs it
+# (see the Smithy check in preflight-deploy.sh).
+echo "$INPUTS_HASH" > "$GENERATED_DIR/.inputs.sha256"
 
 echo ""
 echo "=== Code generation complete ==="

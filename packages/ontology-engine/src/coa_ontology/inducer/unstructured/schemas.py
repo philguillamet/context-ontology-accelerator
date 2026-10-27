@@ -30,7 +30,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from coa_common.constants import validate_ontology_uri_prefix
+from pydantic import BaseModel, Field, field_validator
 
 from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
@@ -110,6 +111,11 @@ class UnstructuredInductionRequest(BaseModel):
     # entailment engine (parent spec Task 13).
     entailment_enabled: bool = False
 
+    @field_validator("ontology_uri_prefix")
+    @classmethod
+    def _validate_uri_prefix(cls, v: str) -> str:
+        return validate_ontology_uri_prefix(v)
+
 
 class UnstructuredInductionConfig(BaseModel):
     """Internal pipeline config consumed by ``UnstructuredInductionPipeline.run``.
@@ -133,6 +139,10 @@ class UnstructuredInductionConfig(BaseModel):
     description_mode: Literal["label_only", "instance", "schema"]
     include_individuals: bool
     entailment_enabled: bool
+    # Canonical namespace language, resolved server-side by the route from the
+    # namespace item (never from the request). Drives the class-description
+    # prompts, the fixed-text templates and the RDF language tags.
+    namespace_language: str = "en"
 
     # Foundational grounding params (threaded from the request). When
     # grounding_ontology_ids is non-empty AND grounding_service is set, the

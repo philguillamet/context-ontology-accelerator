@@ -6,6 +6,7 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Template, Match } from "aws-cdk-lib/assertions";
+import { expectIdempotencyWiring } from "../utils/idempotency-assertions";
 import { NamespaceStack } from "../../lib/stacks/services";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
 
@@ -51,6 +52,45 @@ describe("NamespaceStack", () => {
     );
   });
 
+  describe("CoaTableMetadata form and CoaRelationalTable asset type", () => {
+    it("declares the optional generatedFields member on the form model", () => {
+      const forms = template.findResources("AWS::DataZone::FormType");
+      const model = JSON.stringify(Object.values(forms));
+      expect(model).toContain("generatedFields: smithy.api#String");
+    });
+
+    it("pins the asset type to the form's current revision", () => {
+      template.hasResourceProperties("AWS::CloudFormation::CustomResource", {
+        Name: "CoaRelationalTable",
+        FormName: "CoaTableMetadata",
+        FormRevision: {
+          "Fn::GetAtt": [Match.stringLikeRegexp("CoaTableMetadataForm"), "Revision"],
+        },
+      });
+    });
+
+    it("lets the asset-type custom resource read the asset type it updates", () => {
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: [
+                "datazone:CreateAssetType",
+                "datazone:GetAssetType",
+                "datazone:DeleteAssetType",
+              ],
+            }),
+          ]),
+        },
+      });
+    });
+  });
+
+  it("wires only the create-operation Lambda(s) to the idempotency table", () => {
+    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
+    expectIdempotencyWiring(template, ["-namespace-api", "-grants-api"]);
+  });
+
   // Build a fresh NamespaceStack with extra context and return the smus-login
   // role's AssumeRolePolicyDocument as a JSON string for trust-principal checks.
   function loginRoleTrustJson(
@@ -87,6 +127,29 @@ describe("NamespaceStack", () => {
     )[0] as any;
     return JSON.stringify(role.Properties.AssumeRolePolicyDocument);
   }
+
+  test("roles, platform-roles and grants Lambdas share the platform Lambda SG", () => {
+    // A per-function auto SG is a new Hyperplane ENI combination, which costs
+    // ~228 s on first deploy; the shared SG reuses the pre-warmed ENI.
+    for (const name of ["roles-api", "platform-roles-api", "grants-api"]) {
+      const fns = template.findResources("AWS::Lambda::Function", {
+        Properties: {
+          FunctionName: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-${name}`,
+        },
+      });
+      const [fn] = Object.values(fns);
+      expect(fn).toBeDefined();
+      const sgs: unknown[] = fn.Properties.VpcConfig.SecurityGroupIds;
+      expect(sgs).toHaveLength(1);
+      expect(JSON.stringify(sgs[0])).toContain("LambdaSG");
+    }
+    const autoSgs = Object.keys(
+      template.findResources("AWS::EC2::SecurityGroup"),
+    ).filter((id) =>
+      /^(Roles|PlatformRoles|Grants)ApiFnSecurityGroup/.test(id),
+    );
+    expect(autoSgs).toEqual([]);
+  });
 
   test("creates Namespaces table with PK/SK", () => {
     template.hasResourceProperties("AWS::DynamoDB::Table", {

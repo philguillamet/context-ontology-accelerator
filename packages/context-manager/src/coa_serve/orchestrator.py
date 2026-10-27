@@ -18,7 +18,7 @@ from .clients.base import LLMClient, QueryExecutor, VectorClient
 from .exceptions import AccessDeniedError, DataSourceUnavailableError, NamespaceScopeDeniedError, NoResultError
 from .identity import display_principal
 from .mode import Mode, resolve_mode
-from .tier2.sql_firewall import NamespaceSQLScopeError
+from .tier2.sql_firewall import NamespaceSQLScopeError, tables_visible_to
 
 if TYPE_CHECKING:
     from .clients.sources_registry import SourceComposition, SourcesRegistry
@@ -43,7 +43,7 @@ from .tier2.strategy import (
     normalize_strategy_option,
 )
 from .tier3.knowledge_retriever import VECTOR_SEARCH_TIMEOUT_S, KnowledgeRetriever
-from .trace import TraceCollector
+from .trace import TraceCollector, client_error_detail
 
 logger = structlog.get_logger(__name__)
 
@@ -790,8 +790,11 @@ class Orchestrator:
                     columns=result.columns,
                     sql_used=result.sql,
                     confidence=result.confidence,
-                    retrieved_tables=result.retrieved_tables,
-                    expanded_tables=result.expanded_tables,
+                    # Response metadata reaches the caller: list only the tables
+                    # the grant's ``tableAllowlist`` permits (the trace steps are
+                    # filtered the same way where they are recorded).
+                    retrieved_tables=tables_visible_to(result.retrieved_tables, profile),
+                    expanded_tables=tables_visible_to(result.expanded_tables, profile),
                     trace=trace,
                     namespace=namespace,
                     principal=display_principal(profile),
@@ -977,7 +980,7 @@ class Orchestrator:
                     StepId.T1_FIREWALL,
                     "error",
                     fw_ms,
-                    detail={"error": type(e).__name__, "message": str(e)[:120]},
+                    detail=client_error_detail(e),
                     tool_used="sql-firewall",
                 )
                 logger.warning(
@@ -1061,11 +1064,7 @@ class Orchestrator:
                     StepId.T1_EXECUTE,
                     "error",
                     exec_ms,
-                    detail={
-                        "error": type(e).__name__,
-                        "message": str(e)[:120],
-                        "timeoutSeconds": timeout_seconds,
-                    },
+                    detail=client_error_detail(e, timeoutSeconds=timeout_seconds),
                     tool_used="sql-engine",
                 )
                 logger.warning(
@@ -1077,12 +1076,15 @@ class Orchestrator:
                     timeout_seconds=timeout_seconds,
                 )
                 # A cross-namespace SQL reference is a policy denial, not a data-source
-                # outage: surface it as 403 with its (non-sensitive) policy reason.
+                # outage: surface it as 403 with a fixed policy reason (never the
+                # executor's message, which is not ours to vouch for).
                 # Detected via the wrapped firewall cause so the executor keeps raising
                 # its own {Athena,Redshift}QueryError (unit-test contract) and generic
                 # executor failures stay masked as DataSourceUnavailableError.
                 if isinstance(e.__cause__, NamespaceSQLScopeError):
-                    raise NamespaceScopeDeniedError(str(e)) from e
+                    raise NamespaceScopeDeniedError(
+                        "Access denied: SQL reference is outside the requested namespace"
+                    ) from e
                 raise DataSourceUnavailableError(
                     f"Metric '{metric_match.metric_name}' execution failed: {type(e).__name__}"
                 ) from e
@@ -1222,6 +1224,12 @@ class Orchestrator:
         has_structured_source: bool = True,
         has_unstructured_source: bool = True,
     ) -> InvokeResponse:
+        # options.includeSupporting=False omits supportingContent from the response
+        # (default True). Tier 3 still retrieves and synthesizes over the chunks;
+        # only the response payload drops them. Checked `is not False` so any other
+        # value (absent, None, True) keeps the chunks — the Smithy/REST default.
+        include_supporting = (options or {}).get("includeSupporting") is not False
+
         # Deep-reasoning Tier-3 path (opt-in). Engaged per-request via
         # options.mode=="deep-reasoning" or as the deployment default. Returns the
         # same Tier3Result contract, so the assembler tail below is shared. When
@@ -1252,7 +1260,7 @@ class Orchestrator:
             )
             result = self._assembler.assemble_tier3(
                 synthesized_answer=tier3_result.synthesized_answer,
-                supporting_content=tier3_result.supporting_content,
+                supporting_content=tier3_result.supporting_content if include_supporting else None,
                 graph_context=tier3_result.graph_context,
                 confidence=tier3_result.confidence,
                 guardrail_blocked=tier3_result.guardrail_blocked,
@@ -1313,7 +1321,7 @@ class Orchestrator:
 
         result = self._assembler.assemble_tier3(
             synthesized_answer=tier3_result.synthesized_answer,
-            supporting_content=tier3_result.supporting_content,
+            supporting_content=tier3_result.supporting_content if include_supporting else None,
             graph_context=tier3_result.graph_context,
             confidence=tier3_result.confidence,
             guardrail_blocked=tier3_result.guardrail_blocked,

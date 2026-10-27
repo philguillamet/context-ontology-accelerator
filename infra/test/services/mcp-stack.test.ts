@@ -298,4 +298,62 @@ describe("McpStack", () => {
       }),
     ).toBe(true);
   });
+
+  it("targets the discovery Lambdas by fixed name, without deploy-time SSM reads", () => {
+    // Reading these ARNs from SSM at deploy time made McpStack (and, through the
+    // shared image asset, ServeStack) wait for the metric-service and ontology
+    // stacks.
+    const runtime = JSON.stringify(
+      template.findResources("AWS::BedrockAgentCore::Runtime"),
+    );
+    for (const fn of ["metric-api", "ontology-api-proxy"]) {
+      expect(runtime).toContain(
+        `:lambda:us-east-1:123456789012:function:${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-${fn}`,
+      );
+    }
+    // The partition comes from the stack, so GovCloud/China ARNs stay valid.
+    expect(runtime).toContain("AWS::Partition");
+    const params = JSON.stringify(template.toJSON().Parameters ?? {});
+    expect(params).not.toContain("/metric/api-fn-arn");
+    expect(params).not.toContain("/ontology-engine/api-fn-arn");
+  });
+});
+
+describe("McpStack - teardown", () => {
+  // AgentCore's ENIs keep McpSG in use for hours after the runtime is deleted.
+  // Retained, the stack deletes at once instead of failing on the group and
+  // keeping every stack it imports from alive; destroy.sh deletes the group.
+  it("retains the runtime security group and tags it for destroy.sh", () => {
+    const app = new cdk.App({ context: TEST_CONTEXT });
+    const depStack = new cdk.Stack(app, "DepStack", {
+      env: { account: "123456789012", region: "us-east-1" },
+    });
+    const vpc = new ec2.Vpc(depStack, "Vpc", { maxAzs: 2 });
+    const mkTable = (id: string) =>
+      new dynamodb.Table(depStack, id, {
+        partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      });
+    const template = Template.fromStack(
+      new McpStack(app, "TestMcpTeardown", {
+        env: { account: "123456789012", region: "us-east-1" },
+        vpc,
+        rolesTable: mkTable("Roles"),
+        resourceRoleMappingsTable: mkTable("RRM"),
+      }),
+    );
+
+    template.hasResource("AWS::EC2::SecurityGroup", {
+      DeletionPolicy: "Retain",
+      UpdateReplacePolicy: "Retain",
+      Properties: Match.objectLike({
+        GroupDescription: "AgentCore Runtime - MCP Server (thin proxy)",
+        Tags: Match.arrayWith([
+          {
+            Key: `${DEFAULT_RESOURCE_PREFIX}:teardown`,
+            Value: "delete-after-eni-release",
+          },
+        ]),
+      }),
+    });
+  });
 });

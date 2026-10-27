@@ -7,6 +7,8 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ERRORS=0
+# Deploy environment, as passed to deploy.sh; names the stacks checked below.
+DEPLOY_ENV="${1:-dev}"
 
 err() { echo "ERROR: $1" >&2; ERRORS=$((ERRORS + 1)); }
 warn() { echo "WARN:  $1" >&2; }
@@ -15,7 +17,7 @@ ok() { echo "  OK:  $1"; }
 echo "=== Pre-deploy preflight checks ==="
 echo ""
 
-# ── 1. Required toolchain versions (Node 22+, Java 17+, pnpm) ────────────
+# ── 1. Required toolchain versions (Node 22+, Java 17-24, pnpm) ──────────
 # Mirrors the versions pinned in .mise.toml. We only check presence/version
 # here — installing mise itself is a one-time local setup step (see
 # scripts/setup-dev.sh) and is intentionally not automated in this script,
@@ -53,43 +55,69 @@ else
 fi
 
 # ── 3. Container engine (Docker or Finch) ─────────────────────────────────
-# CDK shells out to $CDK_DOCKER (default: docker) for asset bundling.
-CONTAINER_ENGINE=""
-if [ -n "${CDK_DOCKER:-}" ]; then
-  if command -v "$CDK_DOCKER" >/dev/null 2>&1 && "$CDK_DOCKER" info >/dev/null 2>&1; then
-    CONTAINER_ENGINE="$CDK_DOCKER"
-    ok "CDK_DOCKER=$CDK_DOCKER (explicit, daemon running)"
+# A missing engine is an error: five stacks build container images, and there is
+# no local fallback for an image (see the helper for the opt-out).
+# shellcheck source=lib/container-engine.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/container-engine.sh"
+coa_check_container_engine
+
+# ── 3b. ARM64 image builds (vkg, serve, mcp) ──────────────────────────────
+# Those stacks pin Platform.LINUX_ARM64 for their image assets. On an x86_64
+# host without a qemu-aarch64 binfmt handler the engine pulls the arm64 base
+# image and the first RUN step dies with `exec /bin/sh: exec format error` —
+# ~20 minutes into the deploy, surfaced only as "Failed to build asset ...".
+# Checked offline (no test image pull). On Linux the kernel's binfmt registry
+# is authoritative for Docker and Finch alike. Elsewhere (Docker Desktop's VM)
+# fall back to buildx, counting only platforms a *running* node detected: a
+# trailing `*` (e.g. `linux/arm64*` on a stopped docker-container builder)
+# marks a platform someone configured, not one the host can execute.
+_arm64_binfmt_registered() {
+  for _bf in "${1:-/proc/sys/fs/binfmt_misc}"/qemu-aarch64*; do
+    [ -f "$_bf" ] && head -n 1 "$_bf" 2>/dev/null | grep -q '^enabled' && return 0
+  done
+  return 1
+}
+# Reads `buildx ls` output on stdin.
+_buildx_lists_runnable_arm64() {
+  grep -E '[[:space:]]running[[:space:]]' | grep -Eq 'linux/arm64(/v8)?([,[:space:]]|$)'
+}
+if [ -n "$CONTAINER_ENGINE" ]; then
+  HOST_ARCH="$(uname -m)"
+  HOST_OS="$(uname -s)"
+  if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then
+    ok "Host is $HOST_ARCH — arm64 image assets build natively"
+  elif [ "$HOST_OS" = "Linux" ] && _arm64_binfmt_registered; then
+    ok "arm64 emulation available on $HOST_ARCH host (qemu-aarch64 binfmt registered)"
+  elif "$CONTAINER_ENGINE" buildx ls 2>/dev/null | _buildx_lists_runnable_arm64; then
+    ok "arm64 emulation available on $HOST_ARCH host (buildx lists linux/arm64)"
+  elif [ "$HOST_OS" = "Linux" ]; then
+    err "Host is $HOST_ARCH and $CONTAINER_ENGINE cannot build linux/arm64 images (needed by the vkg, serve and mcp stacks). Register emulation: docker run --privileged --rm tonistiigi/binfmt --install arm64 — see external-docs/content/deploying.md, 'Cross-architecture container builds'"
   else
-    err "CDK_DOCKER=$CDK_DOCKER set but daemon is not reachable"
+    warn "Could not confirm $CONTAINER_ENGINE can build linux/arm64 images on this $HOST_ARCH host. Verify with: $CONTAINER_ENGINE run --rm --platform linux/arm64 alpine uname -m (should print aarch64)"
   fi
-elif command -v finch >/dev/null 2>&1 && finch info >/dev/null 2>&1; then
-  export CDK_DOCKER=finch
-  CONTAINER_ENGINE=finch
-  ok "Finch daemon running (exported CDK_DOCKER=finch)"
-elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  CONTAINER_ENGINE=docker
-  ok "Docker daemon running"
-else
-  warn "No container engine running (docker/finch) — local pip bundling must succeed"
 fi
 
-# ── 4. Smithy-generated OpenAPI specs ────────────────────────────────────
-OPENAPI_DIR="$REPO_ROOT/smithy-generated/openapi"
-SPEC_COUNT=0
-if [ -d "$OPENAPI_DIR" ]; then
-  SPEC_COUNT=$(find "$OPENAPI_DIR" -name "*.json" -size +100c 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-fi
+# ── 4. Smithy-generated artifacts present AND current ────────────────────
+# smithy-generated/ is gitignored, so `git pull` leaves it at the previous
+# commit's output. Checking only that specs exist would ship handlers against a
+# stale generated model — e.g. a renamed enum member fails the Lambda at import.
+# Regenerate whenever any codegen input changed since the last generation.
+FINGERPRINT="$REPO_ROOT/scripts/smithy-fingerprint.sh"
+SMITHY_STATE="$("$FINGERPRINT" state "$REPO_ROOT")"
+case "$SMITHY_STATE" in
+  current) ok "Smithy generated artifacts are current with the models" ;;
+  missing) warn "smithy-generated/ is missing or empty — running 'make generate'..." ;;
+  unstamped) warn "smithy-generated/ predates input fingerprinting — regenerating once with 'make generate'..." ;;
+  stale) warn "smithy-generated/ is stale (Smithy models or codegen changed since it was generated) — running 'make generate'..." ;;
+  *) err "Could not determine the state of smithy-generated/ ($SMITHY_STATE)" ;;
+esac
 
-if [ "$SPEC_COUNT" -gt 0 ]; then
-  ok "Smithy OpenAPI specs present ($SPEC_COUNT files)"
-else
-  warn "smithy-generated/openapi/ missing or empty — running 'make generate'..."
+if [ "$SMITHY_STATE" = missing ] || [ "$SMITHY_STATE" = unstamped ] || [ "$SMITHY_STATE" = stale ]; then
   if (cd "$REPO_ROOT" && make generate); then
-    SPEC_COUNT=$(find "$OPENAPI_DIR" -name "*.json" -size +100c 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-    if [ "$SPEC_COUNT" -gt 0 ]; then
-      ok "Smithy code generation complete ($SPEC_COUNT OpenAPI specs)"
+    if [ "$("$FINGERPRINT" state "$REPO_ROOT")" = current ]; then
+      ok "Smithy code generation complete"
     else
-      err "'make generate' ran but smithy-generated/openapi/ is still empty."
+      err "'make generate' ran but smithy-generated/ is still not current with the models."
     fi
   else
     err "'make generate' failed. Fix Smithy/Gradle errors above before deploying."
@@ -150,10 +178,12 @@ if [ -n "${CONTAINER_ENGINE:-}" ]; then
       # as the password via 2>&1). Failure is a warning, not a fatal error.
       _ecr_awserr="$(mktemp)"
       if _ecr_pw="$(aws ecr-public get-login-password --region us-east-1 2>"$_ecr_awserr")"; then
-        ECR_LOGIN_ERR="$(printf '%s' "$_ecr_pw" \
-          | "$CONTAINER_ENGINE" login --username AWS --password-stdin public.ecr.aws 2>&1)" \
-          && ok "Authenticated to ECR Public (us-east-1)" \
-          || warn "Could not authenticate to ECR Public; base image pulls fall back to anonymous (rate-limited). Detail: ${ECR_LOGIN_ERR:-unknown error}"
+        if ECR_LOGIN_ERR="$(printf '%s' "$_ecr_pw" \
+            | "$CONTAINER_ENGINE" login --username AWS --password-stdin public.ecr.aws 2>&1)"; then
+          ok "Authenticated to ECR Public (us-east-1)"
+        else
+          warn "Could not authenticate to ECR Public; base image pulls fall back to anonymous (rate-limited). Detail: ${ECR_LOGIN_ERR:-unknown error}"
+        fi
       else
         warn "Could not obtain an ECR Public token from AWS; base image pulls fall back to anonymous (rate-limited). Detail: $(cat "$_ecr_awserr" 2>/dev/null || echo 'unknown error')"
       fi
@@ -166,27 +196,27 @@ else
   warn "No container engine — skipping ECR Public authentication"
 fi
 
-# ── 6. VPC limit check (requires AWS credentials) ────────────────────────
-# Resolution order matches CDK's own precedence (infra/bin/app.ts uses
-# CDK_DEFAULT_REGION as the source of truth) so preflight validates the
-# same region CDK will actually deploy to.
-REGION="${CDK_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}}"
-if command -v aws >/dev/null 2>&1 && aws sts get-caller-identity >/dev/null 2>&1; then
-  VPC_COUNT=$(aws ec2 describe-vpcs --region "$REGION" --query 'length(Vpcs)' --output text 2>/dev/null || echo "?")
-  VPC_LIMIT_RAW=$(aws service-quotas get-service-quota --service-code vpc --quota-code L-F678F1CE --region "$REGION" --query 'Quota.Value' --output text 2>/dev/null || echo "5")
-  VPC_LIMIT="${VPC_LIMIT_RAW%%.*}"
-  [[ "$VPC_LIMIT" =~ ^[0-9]+$ ]] || VPC_LIMIT=5
-  if [ "$VPC_COUNT" != "?" ]; then
-    if [ "$VPC_COUNT" -ge "$VPC_LIMIT" ]; then
-      err "VPC limit reached: $VPC_COUNT/$VPC_LIMIT VPCs in $REGION."
-      err "Delete unused VPCs or request a quota increase before deploying."
-    else
-      ok "VPC headroom: $VPC_COUNT/$VPC_LIMIT used in $REGION"
-    fi
-  fi
-else
-  warn "AWS credentials not available — skipping VPC limit check"
-fi
+# ── 6. Pending teardown and VPC limit (requires AWS credentials) ─────────
+# Resolved the way the CDK CLI resolves it, the profile's region included, so
+# preflight validates the same region CDK will actually deploy to.
+# shellcheck source=lib/resolve-region.sh source-path=SCRIPTDIR
+source "${REPO_ROOT}/scripts/lib/resolve-region.sh"
+REGION="$(coa_resolve_region)"
+# A teardown of this deployment that is still waiting for AgentCore to release
+# its ENIs leaves the network stack undeployable for up to 8 hours.
+TEARDOWN_CHECK="$("$REPO_ROOT/scripts/check-teardown-pending.sh" "$REGION" "${SCL_PREFIX:-coa}" "$DEPLOY_ENV")"
+case $? in
+  0) ok "$TEARDOWN_CHECK" ;;
+  2) warn "$TEARDOWN_CHECK" ;;
+  *) err "$TEARDOWN_CHECK" ;;
+esac
+
+VPC_CHECK="$("$REPO_ROOT/scripts/check-vpc-limit.sh" "$REGION" "${SCL_PREFIX:-coa}-${DEPLOY_ENV}-network")"
+case $? in
+  0) ok "$VPC_CHECK" ;;
+  2) warn "$VPC_CHECK" ;;
+  *) err "$VPC_CHECK" ;;
+esac
 
 # ── 7. Lambda reserved-concurrency headroom (requires AWS credentials) ────
 # The VKG-reload and doc-preprocessing Lambdas each reserve
@@ -304,6 +334,7 @@ _coa_model_geo_prefix() {
 }
 
 _coa_resolve_model_ids() {
+  # shellcheck disable=SC2016  # the single-quoted node -e program is passed to node verbatim, not expanded by the shell
   _COA_DEFAULT_LLM_MODEL_ID="$_DEFAULT_LLM_MODEL_ID" \
   _COA_DEFAULT_EMBED_MODEL_ID="$_DEFAULT_EMBED_MODEL_ID" \
   _COA_DEFAULT_INDUCTION_MODEL_ID="$_DEFAULT_INDUCTION_MODEL_ID" \

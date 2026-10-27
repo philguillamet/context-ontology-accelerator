@@ -382,6 +382,158 @@ class TestMultiMetricDetection:
         assert result.found
         assert result.match_count == 2
 
+    async def test_contained_unspaced_synonym_is_not_a_second_metric(self):
+        """The metric consuming the complete phrase wins over its substring."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.metric_id == "m-aging-equipment-count"
+        assert result.match_count == 1
+        assert result.matched_text == "老朽設備台数"
+        assert result.residual == ""
+
+    async def test_equal_unspaced_synonyms_remain_ambiguous(self):
+        """Containment must not break ties between identical aliases."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count-a",
+                    "name": "equipment_count_a",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-equipment-count-b",
+                    "name": "equipment_count_b",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
+    async def test_disjoint_match_keeps_metric_independent(self):
+        """A contained alias plus a separate hit is still a real second metric."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment",
+                    "name": "equipment_metrics",
+                    "synonyms": ["設備台数", "故障件数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数と故障件数を比較", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
+    async def test_partially_overlapping_aliases_remain_two_metrics(self):
+        """Overlap without containment leaves both metrics standing."""
+        resolver = _make_resolver(
+            seed=[
+                {
+                    "metric_id": "m-aging-equipment",
+                    "name": "aging_equipment",
+                    "synonyms": ["老朽設備"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        # 老朽設備 covers [0, 4) and 設備台数 covers [2, 6): neither contains the other.
+        result = resolver.exact_name_synonym_match("老朽設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.match_count == 2
+
+    async def test_containment_chain_keeps_only_the_longest(self):
+        """台数 ⊂ 設備台数 ⊂ 老朽設備台数: only the outermost metric survives."""
+        resolver = _make_resolver(
+            seed=[
+                {"metric_id": "m-count", "name": "unit_count", "synonyms": ["台数"], "namespace": "maintenance"},
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                },
+                {
+                    "metric_id": "m-aging-equipment-count",
+                    "name": "aging_equipment_count",
+                    "synonyms": ["老朽設備台数"],
+                    "namespace": "maintenance",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("老朽設備台数は？", "maintenance")
+
+        assert result.found
+        assert result.metric_id == "m-aging-equipment-count"
+        assert result.match_count == 1
+
+    async def test_latin_alias_inside_a_longer_alias_also_prefers_the_longer(self):
+        """Pruning is script-independent: longest match wins for Latin aliases too.
+
+        ``revenue`` and ``total revenue`` both match "what is total revenue"
+        with word boundaries. Before containment pruning this was a two-metric
+        question (Tier 2/3); now it resolves to the metric that names the whole
+        phrase.
+        """
+        resolver = _make_resolver(
+            seed=[
+                {"metric_id": "m-revenue", "name": "revenue", "synonyms": [], "namespace": "sales"},
+                {
+                    "metric_id": "m-total-revenue",
+                    "name": "booked_total",
+                    "synonyms": ["total revenue"],
+                    "namespace": "sales",
+                },
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match("what is total revenue", "sales")
+
+        assert result.found
+        assert result.metric_id == "m-total-revenue"
+        assert result.match_count == 1
+
 
 @pytest.mark.unit
 class TestLookup:
@@ -618,6 +770,103 @@ class TestNeptuneRefresh:
         await resolver.match("total_claims", "insurance")
         # No additional Neptune query — snapshot already populated.
         assert mock_neptune.query.await_count == calls_after_start
+
+
+@pytest.mark.unit
+class TestLazyNamespaceOnMiss:
+    """Lazy per-namespace fill on a cache miss (hourly refresh is the backstop)."""
+
+    @staticmethod
+    def _binding(name: str, ns: str) -> dict:
+        # Real Neptune path returns ?g (the graph URI); namespace is derived from it.
+        return {"name": name, "g": f"https://ontology-workbench.local/{ns}/urn%3Aont"}
+
+    async def test_miss_triggers_lazy_lookup_then_matches(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        # Loaded (started) with NOTHING for 'insurance'; the metric appears in a
+        # later publish that the hourly refresh has not yet picked up.
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        assert resolver.loaded
+
+        # Now the metric exists in Neptune; a miss should lazily fetch + persist.
+        mock_neptune.query.return_value = [self._binding("total_claims", "insurance")]
+        m = await resolver.match("how many total_claims are there?", "insurance")
+        assert m.found
+        assert m.metric_name == "total_claims"
+        # Namespace was derived from ?g, not a pre-supplied key.
+        assert resolver._snapshot.by_id["insurance:total_claims"].namespace == "insurance"
+
+    async def test_lazy_lookup_persists_and_does_not_refetch_same_namespace(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+
+        mock_neptune.query.return_value = [self._binding("total_claims", "insurance")]
+        await resolver.match("total_claims", "insurance")
+        calls = mock_neptune.query.await_count
+
+        # Second request for the same namespace must hit the persisted cache,
+        # not Neptune again.
+        m2 = await resolver.match("total_claims", "insurance")
+        assert m2.found
+        assert mock_neptune.query.await_count == calls
+
+    async def test_genuine_miss_hits_neptune_at_most_once_per_namespace(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []  # namespace legitimately has no metrics
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        calls_after_start = mock_neptune.query.await_count
+
+        await resolver.match("no_such_metric", "emptyns")
+        after_first = mock_neptune.query.await_count
+        assert after_first == calls_after_start + 1  # one lazy lookup
+        # A second miss for the same namespace must NOT re-hit Neptune.
+        await resolver.match("still_nothing", "emptyns")
+        assert mock_neptune.query.await_count == after_first
+
+    async def test_full_refresh_clears_lazy_guard_so_namespace_can_refill(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        await resolver.match("x", "emptyns")  # marks emptyns lazily-loaded
+        assert "emptyns" in resolver._lazy_loaded_namespaces
+
+        # The hourly full refresh (replace=True) resets the guard.
+        mock_neptune.query.return_value = []
+        await resolver._refresh_from_neptune()
+        assert "emptyns" not in resolver._lazy_loaded_namespaces
+
+    async def test_lazy_lookup_query_is_namespace_scoped_not_full_scan(self):
+        from unittest.mock import AsyncMock
+
+        mock_neptune = AsyncMock()
+        mock_neptune.query.return_value = []
+        resolver = MetricResolver(neptune_client=mock_neptune)
+        await resolver.start()
+        # Capture the SPARQL the lazy lookup sends.
+        await resolver.match("no_such_metric", "insurance")
+        lazy_sparql = mock_neptune.query.await_args.args[0]
+        # The FILTER must be scoped to this one namespace's graphs (prefix +
+        # "insurance/"), NOT the bare cluster-wide prefix the periodic refresh
+        # uses — otherwise a single miss scans every namespace (the load this
+        # change is meant to avoid).
+        assert 'STRSTARTS(STR(?g), "' in lazy_sparql
+        assert "insurance/" in lazy_sparql
+        # The periodic full refresh query stays broad (no per-namespace segment).
+        assert "insurance/" not in resolver._metric_list_sparql
 
 
 @pytest.mark.unit
@@ -983,22 +1232,18 @@ class TestMetricListSparql:
         assert "published" not in sparql
 
     def test_namespace_extracted_as_first_segment_after_prefix(self):
-        import re as _re
+        from coa_serve.tier1.metric_resolver import _namespace_from_graph_uri
 
-        from coa_serve.tier1.metric_resolver import _metric_list_sparql
-
-        sparql = _metric_list_sparql("https://ontology-workbench.local/{namespace}")
-        # Pull the REPLACE regex out of the generated SPARQL and apply it to a
-        # real metric graph URI: {base}/{ns-uuid}/{encoded ontology id}.
-        m = _re.search(r'REPLACE\(STR\(\?g\), "([^"]+)", "\$1"\)', sparql)
-        assert m, f"REPLACE pattern not found in:\n{sparql}"
-        # The regex is SPARQL-escaped (backslashes doubled for the string literal).
-        # Undo one layer of escaping to get the XPath regex for Python re.
-        ns_regex = m.group(1).replace("\\\\", "\\")
+        prefix = "https://ontology-workbench.local/"
         ns_uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
-        graph = f"https://ontology-workbench.local/{ns_uuid}/urn%3Acoa%3Avocab%23GovernedMetricsOntology"
-        extracted = _re.sub(ns_regex, r"\1", graph)
-        assert extracted == ns_uuid, f"expected {ns_uuid}, got {extracted}"
+        # Real metric graph URI: {base}/{ns-uuid}/{encoded ontology id}.
+        graph = f"{prefix}{ns_uuid}/urn%3Acoa%3Avocab%23GovernedMetricsOntology"
+        assert _namespace_from_graph_uri(graph, prefix) == ns_uuid
+
+    def test_namespace_extraction_returns_empty_when_prefix_absent(self):
+        from coa_serve.tier1.metric_resolver import _namespace_from_graph_uri
+
+        assert _namespace_from_graph_uri("https://other.host/ns/x", "https://ontology-workbench.local/") == ""
 
     def test_falls_back_to_default_template_when_unconfigured(self):
         from coa_serve.tier1.metric_resolver import (
@@ -1015,25 +1260,25 @@ class TestMetricListSparql:
         resolver = MetricResolver(seed=[])
         assert 'STRSTARTS(STR(?g), "https://graph.example/")' in resolver._metric_list_sparql
 
-    def test_prefix_xpath_metacharacters_are_escaped(self):
-        """Review (Kun): a graph prefix containing an XPath regex metacharacter
-        (e.g. `+`) must be escaped in the REPLACE pattern, otherwise namespace
-        capture is corrupted or Neptune fails to parse the regex."""
-        import re as _re
-
+    def test_sparql_has_no_per_row_replace_regex(self):
+        """The per-row REPLACE() regex was the Neptune OOM memory sink; namespace
+        is now derived client-side, so the query must carry no REPLACE()."""
         from coa_serve.tier1.metric_resolver import _metric_list_sparql
 
-        sparql = _metric_list_sparql("https://host/path+to/{namespace}")
-        m = _re.search(r'REPLACE\(STR\(\?g\), "([^"]+)", "\$1"\)', sparql)
-        assert m, f"REPLACE pattern not found in:\n{sparql}"
-        ns_regex = m.group(1)
-        # The '+' must be escaped (\+) in XPath regex, which becomes \\+ in SPARQL string.
-        assert "path\\\\+to" in ns_regex
-        # Undo SPARQL escaping for Python re validation
-        ns_regex_py = ns_regex.replace("\\\\", "\\")
+        sparql = _metric_list_sparql("https://ontology-workbench.local/{namespace}")
+        assert "REPLACE(" not in sparql
+        assert "?g WHERE" in sparql  # returns the raw graph URI instead
+
+    def test_namespace_extraction_handles_prefix_with_metacharacter(self):
+        """A prefix containing a would-be regex metacharacter (e.g. `+`) is a
+        plain string match client-side, so no escaping is needed and capture is
+        exact — the case the old XPath-regex escaping guarded against."""
+        from coa_serve.tier1.metric_resolver import _namespace_from_graph_uri
+
+        prefix = "https://host/path+to/"
         ns_uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
-        graph = f"https://host/path+to/{ns_uuid}/urn%3Acoa"
-        assert _re.sub(ns_regex_py, r"\1", graph) == ns_uuid
+        graph = f"{prefix}{ns_uuid}/urn%3Acoa"
+        assert _namespace_from_graph_uri(graph, prefix) == ns_uuid
 
 
 @pytest.mark.unit
@@ -1313,6 +1558,64 @@ class TestNonAsciiMatching:
         assert result.found
         assert result.residual == expected, f"{query!r} must leave {expected!r} as residual"
 
+    @pytest.mark.parametrize("qualifier", ["ごご", "もも", "かが", "とも"])
+    async def test_hiragana_content_word_is_not_proved_by_particle_decomposition(self, qualifier):
+        """A content word made from one-scalar particles must force Tier 2/3.
+
+        The complete hiragana run includes the following ``の``. Accepting any
+        stop-word decomposition swallowed the whole run and let Tier 1 execute
+        the unfiltered metric at confidence 1.0.
+        """
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(f"{qualifier}の総発電容量", "energy")
+
+        assert result.found
+        assert result.residual == f"{qualifier}の"
+
+    @pytest.mark.parametrize("qualifier", ["ごご", "もも", "かが"])
+    @pytest.mark.parametrize("ending", ["ですか", "です", "ください"])
+    async def test_trailing_hiragana_content_word_is_not_swallowed(self, qualifier, ending):
+        """A content word before a polite ending must still force Tier 2/3.
+
+        「総発電容量はごごですか」 fuses ``はごごですか`` into one run. A
+        multi-scalar fragment elsewhere in the run (``ですか``) must not vouch
+        for the adjacent one-scalar pair ``ご`` + ``ご``.
+        """
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(f"総発電容量は{qualifier}{ending}", "energy")
+
+        assert result.found
+        assert qualifier in result.residual
+
+    @pytest.mark.parametrize("run", ["では", "には", "とは", "のは", "でも", "にも", "での"])
+    def test_reviewed_particle_pair_is_scaffolding(self, run):
+        from coa_serve.tier1.metric_resolver import _is_stop_scaffolding
+
+        assert _is_stop_scaffolding(run)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "総発電容量とは",
+            "総発電容量とはいくらですか",
+            "では総発電容量はいくらですか",
+            "総発電容量はいくらですか",
+            "総発電容量を教えてください",
+            "総発電容量はおいくらですか",
+            "総発電容量はおいくつですか",
+            "総発電容量はおいくらでしょうか",
+        ],
+    )
+    async def test_particle_pair_inside_a_question_resolves_at_tier1(self, query):
+        resolver = self._resolver()
+
+        result = resolver.exact_name_synonym_match(query, "energy")
+
+        assert result.found
+        assert result.residual == "", f"unexpected residual for {query!r}: {result.residual!r}"
+
     async def test_oversized_hiragana_run_is_not_decomposed(self):
         """A hiragana run past the ceiling skips the O(n²) DP and trips the gate.
 
@@ -1366,6 +1669,78 @@ class TestNonAsciiMatching:
 
         result = resolver.exact_name_synonym_match("monthlykwh使用量", "energy")
         assert not result.found
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "設備台数は何台ですか",
+            "設備台数はいくつですか",
+            "設備台数はどれくらいですか",
+            "設備台数はどのくらいですか",
+        ],
+    )
+    async def test_japanese_quantity_question_has_no_residual(self, query):
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(query, "maintenance")
+
+        assert result.found
+        assert result.residual == ""
+
+    @pytest.mark.parametrize("counter", ["何件", "何名", "何社"])
+    async def test_japanese_counter_question_tokens_are_consumed(self, counter):
+        """Counter compounds are one kanji token, not decomposable hiragana."""
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-count",
+                    "name": "record_count",
+                    "synonyms": ["対象数"],
+                    "namespace": "counts",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(f"対象数は{counter}ですか", "counts")
+
+        assert result.found
+        assert result.residual == ""
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("東京地域の設備台数は何台ですか", "東京地域"),
+            # The adjacent qualifier forms one kanji run with the counter.
+            # Exact membership therefore fails closed and preserves the whole
+            # run instead of partially swallowing the question.
+            ("設備台数は何台以上ですか", "何台以上"),
+        ],
+    )
+    async def test_japanese_counter_does_not_hide_a_real_qualifier(self, query, expected):
+        resolver = MetricResolver(
+            seed=[
+                {
+                    "metric_id": "m-equipment-count",
+                    "name": "equipment_count",
+                    "synonyms": ["設備台数"],
+                    "namespace": "maintenance",
+                }
+            ]
+        )
+
+        result = resolver.exact_name_synonym_match(query, "maintenance")
+
+        assert result.found
+        assert result.residual == expected
 
     async def test_korean_particle_attachment_matches_and_gates(self):
         """Hangul attaches particles directly (총매출은) — the match must land.

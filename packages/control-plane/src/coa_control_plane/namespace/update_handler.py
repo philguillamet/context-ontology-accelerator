@@ -10,12 +10,16 @@ import os
 from typing import Any
 
 import structlog
+from coa_common.constants import validate_namespace_id
 from coa_common.dao import DynamoDBDAO
+from coa_common.language_tags import effective_namespace_language
 from coa_common.response import api_response
 from coa_control_plane_server.models.update_namespace_request_content import (
     UpdateNamespaceRequestContent,
 )
 from pydantic import ValidationError
+
+from .validation_errors import format_validation_error
 
 logger = structlog.get_logger(__name__)
 
@@ -39,6 +43,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     if not namespace_id:
         return api_response(400, {"message": "namespaceId is required"})
+    try:
+        validate_namespace_id(namespace_id)
+    except ValueError as exc:
+        return api_response(400, {"message": str(exc)})
 
     try:
         body = json.loads(event.get("body") or "{}")
@@ -48,13 +56,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         req = UpdateNamespaceRequestContent.model_validate(body)
     except ValidationError as exc:
-        msg = exc.errors()[0]["msg"] if exc.errors() else str(exc)
-        return api_response(400, {"message": msg})
+        return api_response(400, {"message": format_validation_error(exc)})
 
     # Verify namespace exists
     item = _get_ns_dao().get({"PK": f"NS#{namespace_id}", "SK": "METADATA"})
     if not item:
-        return api_response(404, {"message": f"Namespace not found: {namespace_id}"})
+        return api_response(404, {"message": "Namespace not found"})
 
     # Build update fields from validated request
     update_fields: dict[str, Any] = {}
@@ -81,6 +88,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "description": updated.get("description"),
         "owner": updated.get("owner"),
         "status": updated.get("status"),
+        "language": effective_namespace_language(updated),
         "dataZoneProjectId": updated.get("dataZoneProjectId"),
         "sourceCount": updated.get("sourceCount", 0),
         "createdAt": updated.get("createdAt"),

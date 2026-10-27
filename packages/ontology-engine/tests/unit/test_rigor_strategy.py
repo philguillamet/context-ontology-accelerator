@@ -949,23 +949,32 @@ class TestBuildR2rmlDefault:
         ) in g
 
     def test_fk_column_gets_referencing_object_map(self, strategy):
-        table = CatalogTable(
-            id="orders",
-            name="orders",
-            fullyQualifiedName="db.orders",
-            columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
-            tableConstraints=[
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY",
-                    columns=["customer_id"],
-                    referredColumns=["customers.id"],
-                ),
-            ],
-        )
+        tables = [
+            CatalogTable(
+                id="customers",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="BIGINT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="orders",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                    ),
+                ],
+            ),
+        ]
         g = strategy.build_r2rml(
             "http://ex.org/ind#",
-            [table],
-            {"orders"},
+            tables,
+            {"orders", "customers"},
             Graph(),
         )
         from coa_ontology.inducer.strategies.base import RR
@@ -1166,20 +1175,29 @@ class TestBuildR2rmlDefault:
     def test_fk_target_extracted_from_two_part_referredcolumns(self, strategy):
         """Bug 2a: referredColumns format is 'TargetTable.column' — parts[0] is the table name.
         induce_catalog.py always writes two-part format so this is the canonical path."""
-        table = CatalogTable(
-            id="t",
-            name="orders",
-            fullyQualifiedName="db.orders",
-            columns=[CatalogColumn(name="customer_id", dataType="INT")],
-            tableConstraints=[
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY",
-                    columns=["customer_id"],
-                    referredColumns=["customers.id"],
-                ),
-            ],
-        )
-        g = strategy.build_r2rml("http://ex.org/ind#", [table], {"orders"}, Graph())
+        tables = [
+            CatalogTable(
+                id="customers",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="INT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="t",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[CatalogColumn(name="customer_id", dataType="INT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                    ),
+                ],
+            ),
+        ]
+        g = strategy.build_r2rml("http://ex.org/ind#", tables, {"orders", "customers"}, Graph())
         from coa_ontology.inducer.strategies.base import RR
 
         om = URIRef("http://ex.org/ind#TriplesMap_Orders/POM_CustomerId/ObjectMap")
@@ -1284,6 +1302,151 @@ class TestBuildR2rmlRigorOverride:
             ],
         )
 
+    def test_quoted_column_is_skipped_but_table_keeps_its_pk_subject(self, strategy, caplog):
+        prefix = "http://ex.org/ind#"
+        proposal = self._make_graph(prefix)
+        table = CatalogTable(
+            id="customers",
+            name="customers",
+            fullyQualifiedName="db.customers",
+            columns=[
+                CatalogColumn(name="id", dataType="BIGINT"),
+                CatalogColumn(name='nick"name', dataType="VARCHAR"),
+                CatalogColumn(name="email", dataType="VARCHAR"),
+            ],
+            tableConstraints=[
+                CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"]),
+            ],
+        )
+
+        with caplog.at_level("WARNING"):
+            g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
+
+        from coa_ontology.inducer.strategies.base import RR
+
+        referenced_columns = [
+            str(value)
+            for predicate in (RR.template, RR.column, RR.child, RR.parent)
+            for value in g.objects(None, predicate)
+        ]
+        assert 'nick""name' not in "\n".join(referenced_columns)
+        assert str(g.value(URIRef(f"{prefix}TriplesMap_customers/SubjectMap"), RR.template)) == (
+            f'{prefix}customers/{{"id"}}'
+        )
+        assert str(g.value(URIRef(f"{prefix}TriplesMap_customers/POM_Email/ObjectMap"), RR.column)) == '"email"'
+        assert any(
+            record.message == "r2rml_column_skipped_embedded_quote"
+            and record.table == "customers"
+            and record.column == 'nick"name'
+            for record in caplog.records
+        )
+
+    def test_quoted_pk_column_skips_the_table(self, strategy, caplog):
+        # Substituting `email` for the PK would mint one individual per email
+        # value, and FK templates pointing here assume the PK.
+        prefix = "http://ex.org/ind#"
+        proposal = self._make_graph(prefix)
+        table = CatalogTable(
+            id="customers",
+            name="customers",
+            fullyQualifiedName="db.customers",
+            columns=[
+                CatalogColumn(name='id"quoted', dataType="BIGINT"),
+                CatalogColumn(name="email", dataType="VARCHAR"),
+            ],
+            tableConstraints=[
+                CatalogConstraint(constraintType="PRIMARY_KEY", columns=['id"quoted']),
+            ],
+        )
+
+        with caplog.at_level("WARNING"):
+            g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
+
+        from coa_ontology.inducer.strategies.base import RR
+
+        assert list(g.subjects(RDF.type, RR.TriplesMap)) == []
+        warning = next(
+            record for record in caplog.records if record.message == "r2rml_table_skipped_unsupported_primary_key"
+        )
+        assert warning.table == "customers"
+        assert warning.columns == ['id"quoted']
+
+    def test_object_property_to_skipped_target_is_left_unmapped(self, strategy, caplog):
+        # `customers` is skipped for its quoted PK. The FK from `orders` must not
+        # mint IRIs under a TriplesMap that does not exist, and must not become a
+        # literal under an owl:ObjectProperty (Ontop rejects that mismatch).
+        prefix = "http://ex.org/ind#"
+        g = Graph()
+        ns = Namespace(prefix)
+        PROV = Namespace("http://www.w3.org/ns/prov#")
+        base = prefix.rstrip("#/")
+        for cls, tbl in ((ns.Order, "orders"), (ns.Customer, "customers")):
+            g.add((cls, RDF.type, OWL.Class))
+            g.add((cls, PROV.wasDerivedFrom, URIRef(f"{base}/provenance/{tbl}")))
+        g.add((ns.placedBy, RDF.type, OWL.ObjectProperty))
+        g.add((ns.placedBy, RDFS.domain, ns.Order))
+        g.add((ns.placedBy, RDFS.range, ns.Customer))
+        g.add((ns.placedBy, PROV.wasDerivedFrom, URIRef(f"{base}/provenance/orders/customer_id")))
+        tables = [
+            CatalogTable(
+                id="customers",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name='i"d', dataType="BIGINT"), CatalogColumn(name="email", dataType="VARCHAR")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=['i"d'])],
+            ),
+            CatalogTable(
+                id="orders",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[
+                    CatalogColumn(name="id", dataType="BIGINT"),
+                    CatalogColumn(name="customer_id", dataType="BIGINT"),
+                ],
+                tableConstraints=[
+                    CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"]),
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY", columns=["customer_id"], referredColumns=["customers.email"]
+                    ),
+                ],
+            ),
+        ]
+
+        with caplog.at_level("WARNING"):
+            r = RigorOntologyStrategy().build_r2rml(prefix, tables, {"orders", "customers"}, g)
+
+        from coa_ontology.inducer.strategies.base import RR
+
+        assert set(r.subjects(RDF.type, RR.TriplesMap)) == {URIRef(f"{prefix}TriplesMap_orders")}
+        assert (None, RR.predicate, ns.placedBy) not in r
+        assert any(
+            record.message == "r2rml_relationship_left_unmapped" and record.column == "customer_id"
+            for record in caplog.records
+        )
+
+    def test_fk_target_token_is_none_for_unmapped_target(self):
+        from coa_ontology.inducer.strategies.base import (
+            ambiguous_target_names,
+            reference_index,
+            subject_template_names,
+            table_identity,
+        )
+
+        tables = [
+            CatalogTable(id="customers", name="customers", fullyQualifiedName="db.customers", columns=[]),
+            CatalogTable(id="orders", name="orders", fullyQualifiedName="db.orders", columns=[]),
+        ]
+        args = (
+            "customers",
+            tables[1],
+            reference_index(tables),
+            subject_template_names(tables),
+            ambiguous_target_names(tables),
+            None,
+        )
+        assert RigorOntologyStrategy._fk_target_token(*args) == "customers"
+        assert RigorOntologyStrategy._fk_target_token(*args, {table_identity(tables[0])}) is None
+
     def test_predicate_comes_from_generated_graph_not_naming_convention(self, strategy):
         prefix = "http://ex.org/ind#"
         proposal = self._make_graph(prefix)
@@ -1360,6 +1523,16 @@ class TestBuildR2rmlRigorOverride:
                 URIRef(f"{prefix.rstrip('#/')}/provenance/orders"),
             )
         )
+        # Class for the in-run target 'customers' so the FK target resolves to a
+        # minted TriplesMap rather than degrading to a literal.
+        g.add((ns.Customer, RDF.type, OWL.Class))
+        g.add(
+            (
+                ns.Customer,
+                PROV.wasDerivedFrom,
+                URIRef(f"{prefix.rstrip('#/')}/provenance/customers"),
+            )
+        )
         # Object property for customer FK
         g.add((ns.placedBy, RDF.type, OWL.ObjectProperty))
         g.add((ns.placedBy, RDFS.domain, ns.Order))
@@ -1373,23 +1546,32 @@ class TestBuildR2rmlRigorOverride:
             )
         )
 
-        table = CatalogTable(
-            id="orders",
-            name="orders",
-            fullyQualifiedName="db.orders",
-            columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
-            tableConstraints=[
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY",
-                    columns=["customer_id"],
-                    referredColumns=["customers.id"],
-                ),
-            ],
-        )
+        tables = [
+            CatalogTable(
+                id="customers",
+                name="customers",
+                fullyQualifiedName="db.customers",
+                columns=[CatalogColumn(name="id", dataType="BIGINT")],
+                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
+            ),
+            CatalogTable(
+                id="orders",
+                name="orders",
+                fullyQualifiedName="db.orders",
+                columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
+                tableConstraints=[
+                    CatalogConstraint(
+                        constraintType="FOREIGN_KEY",
+                        columns=["customer_id"],
+                        referredColumns=["customers.id"],
+                    ),
+                ],
+            ),
+        ]
         r = RigorOntologyStrategy().build_r2rml(
             prefix,
-            [table],
-            {"orders"},
+            tables,
+            {"orders", "customers"},
             g,
         )
         from coa_ontology.inducer.strategies.base import RR

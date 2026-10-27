@@ -11,56 +11,84 @@ This guide walks you through deploying Context Ontology Accelerator into your AW
 | Node.js | 22+ | CDK CLI, web-app build |
 | Python | 3.12 | Backend services |
 | pnpm | 10+ | TypeScript package management |
-| uv | 0.4+ | Python package management |
+| uv | 0.5.14+ | Python package management |
 | Java | 17+ | Smithy code generation |
-| Docker | — | Container image builds |
+| Docker or Finch | — | Container image builds (required) |
 
-### ARM64 container builds on x86_64 hosts
+A running container engine is required: the MCP, Ontology, Serve, Sources and
+VKG stacks build container images, and there is no fallback without one. The
+preflight check stops the deploy when it finds no running engine. It uses
+`CDK_DOCKER` when set, otherwise a running Finch, otherwise Docker.
 
-Several CDK assets are built explicitly for `linux/arm64`: the Context Manager
-(Serve), MCP, and VKG images. A native ARM64 machine needs no emulation. An
-x86_64 Linux host must have binfmt/QEMU registered before Docker can execute
-ARM64 build steps; otherwise the build commonly stops with `exec format error`.
+If you know no container image changed since the last deploy, CDK reuses the
+images already in ECR and needs no engine. Set `SCL_ALLOW_NO_CONTAINER_ENGINE=1`
+to deploy without one; any changed image still fails the deploy at build time.
+
+### Cross-architecture container builds
+
+The CDK assets are built for two architectures, so every build host needs
+emulation for one of them:
+
+| Built for | Images |
+|---|---|
+| `linux/arm64` | Context Manager (Serve), MCP, VKG |
+| `linux/amd64` | Ontology engine, DB enrichment, document KG build |
+
+An x86_64 host needs ARM64 emulation; an ARM64 host (Apple Silicon, Graviton)
+needs amd64 emulation. Docker can only run a build's `RUN` steps for another
+architecture once binfmt/QEMU is registered for it; otherwise the build
+commonly stops with `exec format error`.
+The preflight check (`scripts/preflight-deploy.sh`) fails on an x86_64 Linux
+host where it finds no ARM64 emulation, before CDK starts building.
 
 Docker Desktop includes multi-platform emulation on supported installations.
 Verify the active Docker builder before deploying:
 
 ```bash
 docker buildx inspect --bootstrap
-docker run --rm --platform linux/arm64 alpine uname -m
+docker run --rm --platform linux/arm64 alpine uname -m   # x86_64 host: should print aarch64
+docker run --rm --platform linux/amd64 alpine uname -m   # ARM64 host: should print x86_64
 ```
 
-The builder's platform list should include `linux/arm64`, and the second command
-should print `aarch64`. If Docker Engine on Linux does not have ARM64 emulation,
-follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
+The builder's platform list should include both `linux/arm64` and
+`linux/amd64`. If Docker Engine on Linux is missing the emulator for the other
+architecture, follow [Docker's QEMU setup guidance](https://docs.docker.com/build/building/multi-platform/#qemu).
 The [tonistiigi/binfmt installer](https://github.com/tonistiigi/binfmt#installing-emulators)
 accepts an architecture-specific install so the host only registers the
-emulator needed here:
+emulator it needs:
 
 ```bash
+# x86_64 host
 docker run --privileged --rm tonistiigi/binfmt --install arm64
+# ARM64 host
+docker run --privileged --rm tonistiigi/binfmt --install amd64
 
 # Verify again before make deploy-dev
-docker run --rm --platform linux/arm64 alpine uname -m
+docker run --rm --platform linux/arm64 alpine uname -m   # x86_64 host
+docker run --rm --platform linux/amd64 alpine uname -m   # ARM64 host
 ```
 
 !!! warning "binfmt installation is privileged"
     Registering binfmt modifies the host kernel configuration and the command
     above runs a privileged container. Follow your organization's host-security
-    policy. Where privileged setup is not allowed, use a native ARM64 builder or
-    supply prebuilt ARM64 ECR images instead of building the assets locally.
-    `context_manager_image_uri` supplies the shared Context Manager image used
-    by the Serve and MCP stacks. VKG requires `vkg_image_uri` together with
-    `ecr_repository_arn` and `ecr_repository_name`.
+    policy. Where privileged setup is not allowed, supply prebuilt ECR images
+    for the other architecture instead of building those assets locally.
+    ARM64: `context_manager_image_uri` supplies the shared Context Manager
+    image used by the Serve and MCP stacks; VKG requires `vkg_image_uri`
+    together with `ecr_repository_arn` and `ecr_repository_name`. amd64:
+    `ontology_engine_image_uri`, `sources_db_enrichment_image_uri` and
+    `sources_kg_build_image_uri`, each also with `ecr_repository_arn` and
+    `ecr_repository_name`.
 
 If a build still fails:
 
 1. Check whether `CDK_DOCKER` selects Docker, Finch, or another engine. Register
    emulation in the same engine that CDK will use.
 2. When Docker is active, re-run `docker buildx inspect --bootstrap` and confirm
-   `linux/arm64` is listed.
-3. Run the Docker Alpine verification command above. An `exec format error` there is a
-   host/emulation problem, before CDK or application code is involved.
+   the other architecture (`linux/arm64` or `linux/amd64`) is listed.
+3. Run the Docker Alpine verification command above for that platform. An
+   `exec format error` there is a host/emulation problem, before CDK or
+   application code is involved.
 4. On a remote or custom builder, inspect the selected builder with
    `docker buildx ls`; registration on the local default engine does not
    configure a different builder automatically.
@@ -77,7 +105,7 @@ or sandbox account it is worth confirming them up front:
 
 | Quota | Code | Requirement | If too low |
 |-------|------|-------------|------------|
-| **VPC** (VPCs per Region) | `L-F678F1CE` | Room for one more VPC in the target region | Delete an unused VPC or request an increase |
+| **VPC** (VPCs per Region) | `L-F678F1CE` | Room for one more VPC in the target region. Only checked when the deploy creates a VPC: not on an update of an existing deployment, and not with `SCL_VPC_ID` | Delete an unused VPC or request an increase |
 | **Lambda** (Concurrent executions) | `L-B99A9384` | Enough unreserved headroom to reserve the deployment's Lambda concurrency (default 5 × 2 functions = 10) above Lambda's account-wide minimum of 10 | Request an increase, **or** deploy with `SCL_LAMBDA_RESERVED_CONCURRENCY=0` (see [Lambda reserved concurrency](#lambda-reserved-concurrency)) |
 
 Check them with:
@@ -102,7 +130,7 @@ fuller list and why each one matters here.
 
 ### Region Selection
 
-Context Ontology Accelerator defaults to `us-east-1` if no region is set. To deploy to a different region, export `AWS_DEFAULT_REGION` (used by the AWS CLI and preflight checks) **and** `CDK_DEFAULT_REGION` (used by CDK/`bin/app.ts` for AZ resolution and region-specific config) before running any deploy command:
+If no region is set in the environment, Context Ontology Accelerator deploys to the region of your active AWS CLI profile (`aws configure get region`, which honors `AWS_PROFILE`), and to `us-east-1` if the profile has none. The CDK CLI and the deploy, preflight and destroy scripts resolve it the same way. To deploy to a different region, export `AWS_DEFAULT_REGION` (used by the AWS CLI and preflight checks) **and** `CDK_DEFAULT_REGION` (used by CDK/`bin/app.ts` for AZ resolution and region-specific config) before running any deploy command:
 
 ```bash
 export AWS_DEFAULT_REGION=us-west-2
@@ -162,8 +190,8 @@ or the bare in-region model ID. The models to check:
 
 | Model | Used for |
 |-------|----------|
-| Claude Sonnet 4.6 | Induction, grounding |
-| Claude Haiku 4.5 | Rerank, enrichment, document ingestion |
+| Claude Sonnet 4.6 | Induction |
+| Claude Haiku 4.5 | Grounding rerank, enrichment, document ingestion |
 | Claude Sonnet 5 | Serve query resolution (NL-to-SPARQL, synthesis) |
 | Cohere Embed v4 | All embeddings |
 
@@ -184,11 +212,25 @@ exactly as it does today; outside the US the defaults are unusable (see the warn
 
 | Config key | Sets the model for | Default |
 |------------|--------------------|---------|
-| `bedrockLlmModelId` | Serve query LLM (NL-to-SPARQL, synthesis) | `us.anthropic.claude-sonnet-5` |
+| `bedrockLlmModelId` | Serve query LLM (NL-to-SPARQL, synthesis, GraphRAG lexical retrieval) | `us.anthropic.claude-sonnet-5` |
 | `bedrockEmbedModelId` | **All** embeddings — induction, doc-KG-build, metric matching, serve retrieval | `us.cohere.embed-v4:0` |
 | `bedrockEmbedDimensions` | Vector dimension for the embedding model above | `1024` |
-| `bedrockInductionLlmModelId` | Ontology induction, grounding rerank, description generation | `us.anthropic.claude-sonnet-5` |
+| `bedrockInductionLlmModelId` | Ontology induction, description generation | `us.anthropic.claude-sonnet-5` |
 | `bedrockChatModelId` | Source enrichment, constraint inference, document-ingestion extraction | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| `bedrockGroundingLlmModelId` | Ontology-engine grounding reranker | *follows `bedrockChatModelId`* |
+
+Grounding rerank is a cheap, high-volume call, so `bedrockGroundingLlmModelId` defaults to
+whatever `bedrockChatModelId` resolves to (a Haiku-class model) rather than the heavier
+induction model. Set it to a region-valid profile id (e.g. a `jp.`/`global.` Haiku) when
+deploying outside the US so the rerank call does not reject the default `us.` profile.
+It feeds the ontology-engine `GROUNDING_LLM_MODEL_ID` environment variable; the
+grounding region follows `LLM_REGION` (the deploy region). Like the other model keys it is
+geography-validated at `cdk synth`.
+
+GraphRAG lexical retrieval calls the model through llama-index's `BedrockConverse`, which accepts only
+the models in its own table (Claude Sonnet 4.6 and Sonnet 5 in the pinned version). If `bedrockLlmModelId`
+names another model, the Tier 3 lexical retrieval strategies fail when they start, while the rest of serve
+keeps working.
 
 Both **geographic inference profiles** (`us.`, `eu.`, `apac.`, `jp.`, `global.`) and **bare in-region model
 IDs** (e.g. `cohere.embed-v4:0`) are accepted — bare IDs matter because some models publish geo
@@ -290,11 +332,11 @@ curl https://mise.run | sh
 mise install
 
 # make setup runs smithy-generate.sh (make generate) + setup-dev.sh
-# (uv sync --all-packages, pnpm install, pre-commit hooks)
+# (uv sync --all-packages, pnpm install --frozen-lockfile, pre-commit hooks)
 make setup
 ```
 
-`make deploy-dev` re-checks required toolchain versions and re-runs Smithy codegen (`make generate`) automatically if `smithy-generated/` is missing or stale, so a manual re-run is only needed if you want generated artifacts refreshed without doing a full deploy.
+`make deploy-dev` re-checks required toolchain versions and re-runs Smithy codegen (`make generate`) automatically if `smithy-generated/` is missing or stale — stale meaning a Smithy model or the codegen configuration changed since it was last generated, as after a `git pull` that changes an API — so a manual re-run is only needed if you want generated artifacts refreshed without doing a full deploy.
 
 ## Deploy
 
@@ -304,10 +346,12 @@ make deploy-dev
 
 This runs `scripts/deploy.sh` which:
 
-1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker, regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks VPC quota
+1. **Preflight checks** — verifies toolchain versions (Node, Java, pnpm), Docker (including ARM64 emulation on x86_64 hosts), regenerates Smithy artifacts if missing/stale, authenticates to ECR Public, checks that no teardown of the same prefix is still finishing, checks VPC quota
 2. **Builds all packages** — compiles TypeScript, bundles Lambdas
 3. **Synthesizes CloudFormation** — generates templates from CDK
-4. **Deploys all stacks** — CDK handles ordering via dependency graph
+4. **Deploys all stacks** — CDK handles ordering via the dependency graph, deploying up to three independent stacks at once
+
+`make deploy-dev` then deploys the [Databricks SQL Warehouse connector](#the-databricks-sql-warehouse-connector). On a first deploy it starts as soon as the stacks it reads from exist, alongside the remaining platform stacks.
 
 !!! note "ECR Public authentication is automatic"
     `make deploy-dev` authenticates to ECR Public (`us-east-1`) as part of its preflight checks. No manual `docker login` step is needed.
@@ -319,10 +363,11 @@ This runs `scripts/deploy.sh` which:
 | Stack | Purpose |
 |-------|---------|
 | `coa-dev-network` | VPC, subnets, security groups |
+| `coa-dev-eni-warm` | Never-invoked Lambda functions that pre-create the VPC network interfaces the service stacks' Lambdas share (see below) |
 | `coa-dev-auth` | Cognito User Pool, OIDC configuration |
 | `coa-dev-guardrail` | Bedrock guardrails |
 | `coa-dev-storage` | Neptune (graph DB), OpenSearch Serverless |
-| `coa-dev-authnz` | DynamoDB tables for roles, grants, Cedar policies |
+| `coa-dev-authnz` | DynamoDB tables for roles, grants, Cedar policies, and `clientToken` retry records (on-demand billing, 24-hour TTL; if the retry table is unreachable, creates that carry a `clientToken` return `503`) |
 | `coa-dev-vkg` | Virtual Knowledge Graph (Ontop) |
 | `coa-dev-namespace` | Namespace service (SMUS domain) |
 | `coa-dev-metric-service` | Metric authoring and validation |
@@ -335,19 +380,21 @@ This runs `scripts/deploy.sh` which:
 | `coa-dev-ontology` | Ontology engine (induction, reasoning) |
 | `coa-dev-mcp` | MCP Server on AgentCore Runtime |
 
-Total fresh deploy: **~1.5 hours** for CDK/CloudFormation provisioning of all 16 stacks, once dependencies are installed and Smithy artifacts are generated. Neptune and OpenSearch Serverless provisioning, AgentCore Runtime setup, and cross-stack SSM dependency waits account for most of that time — individual stacks vary widely and several run in parallel, so a per-stack breakdown understates the real end-to-end wall-clock time. CDK resolves the deploy order automatically from the dependency graph declared in `bin/app.ts` — you don't need to deploy stacks individually or in this order by hand.
+Total fresh deploy: **about 40 minutes** for `make deploy-dev` to provision all 17 stacks and the connector, once dependencies are installed and Smithy artifacts are generated (measured from a laptop deploying to `us-east-1`; image build and push time depend on your machine and uplink). Running `cdk deploy --all` directly, without `--concurrency`, deploys one stack at a time and takes about 1.5 hours. Most of the time is spent along one chain of dependent stacks — network → storage (Neptune) → vkg → namespace (DataZone) → serve (AgentCore Runtime) → data-layer → api → web (CloudFront) — while the other stacks deploy alongside it. If a deploy appears stuck, check `aws cloudformation list-stacks` before intervening: it is usually waiting on the Neptune instance, the AgentCore Runtime or the CloudFront distribution.
+
+**Why `coa-dev-eni-warm` exists.** A Lambda function in a VPC reaches it through a [Hyperplane ENI](https://docs.aws.amazon.com/lambda/latest/dg/configuration-vpc.html#configuration-vpc-enis), which Lambda shares between all functions with the same subnets and security groups. The first function to use a new combination waits about four minutes for that interface to be created; later ones take seconds. The platform's VPC Lambdas therefore share a small set of security groups, and `coa-dev-eni-warm` creates one never-invoked function per combination early in the deploy. That only saves time because the warm-up runs while the storage stack is still creating Neptune, which the service stacks wait for anyway. CDK resolves the deploy order automatically from the dependency graph declared in `bin/app.ts` — you don't need to deploy stacks individually or in this order by hand.
 
 !!! warning "First-time setup adds significant time"
-    The ~1.5 hour figure above is CDK/CloudFormation provisioning time only. On a fresh machine or first-time deploy, budget additional time on top of that for: installing `mise`-managed toolchains, `uv sync`/`pnpm install`, Smithy/Gradle codegen (`make generate` — first run downloads Gradle wrappers, openapi-generator, and builds TypeScript clients from scratch), Docker image builds, and CDK bootstrap. Subsequent deploys after initial setup are faster since dependencies and generated artifacts are cached, though CloudFormation provisioning time for a fresh set of stacks remains similar.
+    The deploy time above is CDK/CloudFormation provisioning time only. On a fresh machine or first-time deploy, budget additional time on top of that for: installing `mise`-managed toolchains, `uv sync`/`pnpm install`, Smithy/Gradle codegen (`make generate` — first run downloads Gradle wrappers, openapi-generator, and builds TypeScript clients from scratch), Docker image builds, and CDK bootstrap. Subsequent deploys after initial setup are faster since dependencies and generated artifacts are cached, though CloudFormation provisioning time for a fresh set of stacks remains similar.
 
 ### The Databricks SQL Warehouse connector
 
-`DATABRICKS_SQL_WAREHOUSE` sources are served by **one connector Lambda that Context Ontology Accelerator operates**, deployed from its own CDK app rather than as one of the 16 stacks above. It is not optional and it is not per source: **a `DATABRICKS_SQL_WAREHOUSE` source cannot be registered at all until it exists.** Source creation resolves the connector's function ARN from an SSM parameter the connector's own stack publishes, and fails the create with a `400` naming the missing connector if that parameter is absent — so a deployment that skips this step advertises a source sub-type nothing can serve, and the first person to hit it is whoever tries to onboard a warehouse.
+`DATABRICKS_SQL_WAREHOUSE` sources are served by **one connector Lambda that Context Ontology Accelerator operates**, deployed from its own CDK app rather than as one of the 17 stacks above. It is not optional and it is not per source: **a `DATABRICKS_SQL_WAREHOUSE` source cannot be registered at all until it exists.** Source creation resolves the connector's function ARN from an SSM parameter the connector's own stack publishes, and fails the create with a `400` naming the missing connector if that parameter is absent — so a deployment that skips this step advertises a source sub-type nothing can serve, and the first person to hit it is whoever tries to onboard a warehouse.
 
-`make deploy-dev` deploys it for you, as a second step after the platform stacks:
+`make deploy-dev` deploys it for you. On a first deploy it starts once the platform stacks it reads from (network, serve and sources) are complete, and runs alongside the rest of the platform deploy. When the platform is already deployed, it runs after the platform update, as a second step:
 
 ```bash
-make deploy-dev          # platform stacks, then the connector
+make deploy-dev          # platform stacks and the connector
 ```
 
 To deploy or redeploy just the connector against an already-deployed environment:
@@ -358,7 +405,7 @@ make deploy-databricks-connector
 
 Both run `scripts/deploy-managed-databricks-connector.sh`, which installs the `connectors/` workspace, builds the connector's fat JAR with Maven, and deploys its stack.
 
-!!! important "The order is platform first, then connector — and it cannot be reversed"
+!!! important "The connector needs the platform's network, serve and sources stacks first — and the order cannot be reversed"
     The two deployments each read something the other publishes, in one direction only:
 
     - The connector's stack **reads Context Ontology Accelerator's serve and discovery role ARNs from SSM** (`/<prefix>/<env>/serve/runtime-role-arn` and `/<prefix>/<env>/sources/db-connector-role-arn`) to grant them `lambda:InvokeFunction`, spill-bucket reads and `kms:Decrypt` on its spill key. Those parameters are written by the platform stacks, so the connector cannot synthesize before they exist.
@@ -397,6 +444,16 @@ SCL_PREFIX=myproject make deploy-dev
 # Use an existing VPC
 SCL_VPC_ID=vpc-abc123 make deploy-dev
 
+# Stacks CloudFormation deploys in parallel (default: 3); 1 deploys one stack at a time
+SCL_CDK_CONCURRENCY=1 make deploy-dev
+
+# Container images built in parallel (default: 1). Each parallel build needs its
+# own memory; raise it only if the container engine has memory to spare (on
+# macOS that is the Docker Desktop or Finch VM limit, not the Mac's own memory)
+# With Finch on macOS, parallel builds can race on docker login in the keychain
+# credential helper (error -25299); if they do, set this back to 1
+SCL_ASSET_BUILD_CONCURRENCY=2 make deploy-dev
+
 # SMUS admin principal(s) — override the account's `Admin` role fallback.
 # Comma-separated IAM role/user ARN(s) that human admins federate into to
 # access the SageMaker Unified Studio console. Required on any account that
@@ -415,7 +472,25 @@ SCL_API_DOMAIN=api.ontology.example.com \
 SCL_API_CERT_ARN=arn:aws:acm:us-west-2:123456789012:certificate/api-cert-id \
 SCL_HOSTED_ZONE_ID=Z0123456789ABCDEFGHIJ \
 make deploy-dev
+
+# Optional OoPS! ontology pitfall scan (off by default) — see the note below
+SCL_OOPS_ENDPOINT=https://oops.example.internal/rest make deploy-dev
 ```
+
+!!! warning "The OoPS! pitfall scan sends your ontology to the endpoint you configure"
+    Tier-3 ontology validation can run the OoPS! (OntOlogy Pitfall Scanner)
+    pitfall scanner. To do so it POSTs the whole serialised ontology to the configured endpoint:
+    class and property names, labels, comments, and other literal values such as
+    sampled distinct values. It is therefore **off by default** — with no endpoint
+    configured, validation makes no outbound request and reports one `info` finding,
+    `OOPS_NOT_CONFIGURED`, while the rest of Tier 3 runs as usual.
+
+    To enable it, set `SCL_OOPS_ENDPOINT` (or pass `-c oops_endpoint=<url>` to
+    `cdk deploy`); the deploy sets `OOPS_ENDPOINT` on the ontology-engine container.
+    The value must be an `https://` URL (synth fails otherwise). Point it at a
+    self-hosted OoPS! instance unless you are content for your schema to leave your
+    network. Releases before this one defaulted to the public OoPS! service;
+    deployments that relied on that must now set the endpoint explicitly.
 
 !!! note "Custom domain certificate regions"
     `SCL_UI_CERT_ARN` must be an ACM certificate in `us-east-1` (CloudFront requirement) regardless of your deploy region. `SCL_API_CERT_ARN` must be in the same region you're deploying to (API Gateway requirement). CDK validates both at synth time and fails fast with a clear error if either is in the wrong region.
@@ -460,6 +535,19 @@ SCL_DB_SCAN_ENRICHMENT_TIMEOUT_MINUTES=180 make deploy-dev
 
 The value is minutes and must be a positive number; CDK fails synth otherwise. On a direct `cdk deploy` (rather than the `make`/`deploy.sh` path) pass it as CDK context instead — `--context dbScanEnrichmentTimeoutMinutes=180`, or set it in the `context` block of `infra/cdk.json`. The Step Functions state-machine ceiling is derived automatically as this value plus two minutes, so the per-task deadline always trips first and routes the source to `SCAN_FAILED`.
 
+#### Neptune instance class
+
+The knowledge-graph store is a single provisioned Neptune instance. It defaults to **`db.r8g.large`** (2 vCPU / 16 GiB) — the smaller Graviton class that keeps a first-time or single-tenant deploy's cost down. Neptune sizing is driven by **query concurrency × per-query cost, not graph size**: it allocates two query threads per vCPU, so `large` serves four concurrent SPARQL queries. A `db.r8g.large` runs about **$174/month** on-demand; each step up (`xlarge`, `2xlarge`) doubles both the instance and the price.
+
+```bash
+# Deploy dev Neptune on the larger class (default is db.r8g.large)
+SCL_NEPTUNE_INSTANCE_CLASS=db.r8g.xlarge make deploy-dev
+```
+
+Raise it when SPARQL queries fail with `MemoryLimitExceededException` while CPU sits near 100% — Neptune runs its own memory manager, so query out-of-memory alongside a healthy-looking `FreeableMemory` is AWS's documented signal to add capacity, not a sign the graph is too big. This typically shows up under heavy concurrent load (e.g. a parallel benchmark run), not single-user traffic — a cache-resident graph that OOMs under concurrency often points at a pathological query shape worth fixing before paying for a permanently larger instance.
+
+Valid values are any Graviton (`db.r8g.*`) Neptune instance class offered in your region and AZ. On a direct `cdk deploy` pass it as context instead — `--context neptune_instance_class=db.r8g.xlarge`. Changing the class on a later deploy is an **in-place modify with a short reboot** of that instance (no data loss, since storage is separate), so dev can resize up or down freely; for a non-`dev` environment, do it in a maintenance window or behind a multi-AZ failover.
+
 #### Whole-request budget
 
 Every `/query` request shares one wall clock across all tiers and strategies, defaulting to **170 seconds**. It is the outer bound that each per-stage timeout — including the translation budget below — sits inside, so raising a stage above it buys nothing.
@@ -470,6 +558,41 @@ cdk deploy --context resolve_timeout_s=240
 ```
 
 The value is seconds and is clamped to 10–300, so passing a larger number does not widen the budget. It is one setting on one runtime: REST, MCP and streaming callers all get the same figure, and it does not lift the transport-level 29-second REST ceiling described below. Raise it when questions on wide namespaces are cut off mid-answer rather than answered wrongly — and note that on the default `nl_to_sql_first` strategy the stages share this budget in order, so time an earlier stage spends is taken off the ones after it.
+
+#### Deep-reasoning gather budget
+
+Tier-3 **deep reasoning** runs an agentic tool-use loop (graph traversal, vector search, NL→SQL, and the strategy retrievers) before it synthesizes an answer. The time it may spend *gathering* — before it must stop and synthesize from what it has — is bounded by a budget defaulting to **110 seconds**, sized to sit inside the whole-request budget above (`budget + a synthesis reserve < resolve_timeout_s`).
+
+Unlike the whole-request budget, hitting this one is **not** an error: the agent gracefully stops gathering and synthesizes from whatever context it collected, so an exhausted budget surfaces as a **wrong or incomplete answer**, not a timeout. Raise it when deep-reasoning answers degrade in quality because the agent is being cut off mid-gather — typically under concurrency, where each request's wall-clock stretches and the loop runs out of budget before its retrieval tools finish (observed symptom: retrieval tools handed a near-zero deadline and returning nothing).
+
+```bash
+# Allow up to 145 seconds of gathering before synthesis (default is 110)
+SCL_DEEP_REASONING_TIME_BUDGET_SECONDS=145 make deploy-dev
+```
+
+The value is seconds. It must stay below `resolve_timeout_s` minus the synthesis reserve (25 s), so when you raise it, raise `resolve_timeout_s` in step — the deploy wiring keeps the two together:
+
+```bash
+# Raise both so budget 145 + reserve 25 (=170) stays inside the 175 s request wall
+SCL_DEEP_REASONING_TIME_BUDGET_SECONDS=145 SCL_RESOLVE_TIMEOUT_SECONDS=175 make deploy-dev
+```
+
+`scripts/deploy.sh` maps these variables to the CDK context parameters
+`deep_reasoning_time_budget_s` and `resolve_timeout_s`. For a direct CDK
+deployment, pass `--context deep_reasoning_time_budget_s=145 --context resolve_timeout_s=175`
+or set those keys in `infra/cdk.json`. The Serve runtime receives them as
+`DEEP_REASONING_TIME_BUDGET_S` and `RESOLVE_TIMEOUT_S`; these runtime variables
+are normally managed by the stack rather than set manually.
+
+#### Deep-reasoning step caps and ontology-lookup fast-fail
+
+The gather loop is also bounded by **step** caps, not just the time budget, and those are the cheaper lever when answers are slow but not improving:
+
+- `DEEP_REASONING_MAX_STEPS` (default **5**) — the maximum reasoning steps per sub-question. Each step is a serial planner LLM round-trip plus one tool call, so fewer steps means proportionally less latency. Lowered from 10: in the COA-100 runs the back half of a 10-step loop rarely improved accuracy but did inflate latency (serial round-trips), and a longer context tended to dilute rather than help.
+- `DEEP_REASONING_MAX_NO_PROGRESS_STEPS` (default **2**) — consecutive no-progress steps tolerated before the loop stops with `no_new_information`. Lowered from 3 so a wandering loop stops quickly. `1` restores stop-on-first-miss.
+- `DEEP_REASONING_ONTOLOGY_TIMEOUT_S` (default **6**, floored at 1) — a fast-fail cap on a single graph-backed ontology lookup. The lookup is one preparatory step, so it must not swallow a large slice of the gather budget when Neptune is slow: the underlying graph client's own read-timeout × retry can otherwise stack to ~16 s per lookup. On timeout the ontology degrades to empty (the soft-prior traversal still runs) rather than starving the step budget. Raise it only if ontology lookups legitimately need longer on a very large namespace; it cannot be disabled.
+
+Raise `MAX_STEPS` back toward 10 only if deep-reasoning accuracy demonstrably climbs with more steps on your workload — otherwise fewer steps is both faster and no less accurate.
 
 #### NL→SPARQL translation budget
 
@@ -596,6 +719,7 @@ when tuning a large or pathological source.
 
 | Variable | Set By | Purpose |
 |----------|--------|---------|
+| `OOPS_ENDPOINT` | `ontology-stack.ts`, from the `oops_endpoint` context | REST endpoint of the OoPS! pitfall scanner used by Tier-3 ontology validation. **Unset by default**, which turns the scan off (no outbound request). When set, the serialised ontology is sent to it — see *Configuration Options*. |
 | `SCL_MCP_MODE` | `mcp-stack.ts` | Switches the container entrypoint between Context Manager (default) and MCP Server. When set to `"true"`, the container starts in MCP mode. |
 | `BULK_REVIEW_PAGE_BUDGET` | `worker.py` default | Per-invocation table budget for the bulk-review worker (default `1000`); when a source has more tables, the worker processes one page, re-enqueues a continuation, and resumes across chained invocations rather than silently capping. |
 | `BULK_REVIEW_WALL_CLOCK_BUDGET_S` | `worker.py` default | Per-invocation wall-clock budget in seconds (default `240`), a second guard under the 5-minute Lambda timeout that stops the worker after the current search page and continues in a fresh invocation when neared. |
@@ -1037,13 +1161,22 @@ CDK performs incremental updates — only changed stacks are redeployed.
 make destroy-dev
 ```
 
-This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN can't cleanly delete on its own before running `cdk destroy --all`:
+This runs `scripts/destroy.sh dev`, which orchestrates teardown of resources CFN can't cleanly delete on its own around `cdk destroy`:
 
 1. **Deletes AgentCore Runtimes** (serve + mcp) directly via the Bedrock AgentCore API.
-2. **Waits for AgentCore-owned ENIs to detach** from their security groups — see the [AgentCore ENI wait](#agentcore-eni-wait-can-take-hours) note below. This step is currently a no-op pending a shorter, reliable detach signal.
+2. **Checks the runtimes' ENIs without waiting for them.** AWS releases them up to 8 hours after the runtimes are deleted, and they hold only the runtime security groups, the private subnets and the VPC — see [AgentCore ENIs outlive the runtimes](#agentcore-enis-outlive-the-runtimes).
 3. **Deletes VKG's per-namespace ECS services** (created outside CloudFormation by the ontology-reload Lambda) and waits for them to reach `INACTIVE`.
-4. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
-5. **Runs `cdk destroy --all`**, then verifies no stacks remain.
+4. **Deletes the Cloud Map services** the VKG reload Lambda registered in the private DNS namespace, which CloudFormation cannot delete while they exist.
+5. **Force-deletes the DataZone domain** via `delete-domain --skip-deletion-check`, which cascades through every project, asset, and asset type under it — CloudFormation's own delete can't do this (see [FAQ](#why-does-namespace-stack-fail-to-delete-with-domain-not-empty)).
+6. **Starts deleting the connector stacks** (`<PREFIX>-dev-*-coa-connector`), which are separate CDK apps; step 8 waits for them.
+7. **Runs `cdk destroy` on every stack except network**, re-running it past the failures teardown is known to hit: a runtime security group AWS still holds and a runtime AgentCore is still deleting (the stack is deleted again with either kept out), and an access-log bucket that refilled after it was emptied.
+8. **Finishes the network stack**: waits for the connector stacks, deletes detached Lambda ENIs and the kept runtime security groups once AWS has released their ENIs, then the stack.
+
+One run deletes everything that runs continuously: Neptune, OpenSearch Serverless, the Fargate services, the NAT gateway and the interface endpoints. If AWS still holds the runtimes' ENIs, what remains until the next run is the VPC, its subnets and two security groups, which AWS does not charge for ([Amazon VPC pricing](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html#pricing)); with an imported VPC (`SCL_VPC_ID`), only the two security groups. The script then **exits 3** and prints what is left, when the runtimes were deleted, and the commands to delete the rest by hand. Run `make destroy-dev` again after that (AWS releases the ENIs up to 8 hours after the runtimes were deleted), or set `SCL_ENI_WAIT_MAX_SECONDS` to wait in one run. It defers only while AgentCore's own ENIs hold what is left: anything else that keeps the network stack or a runtime security group is a failure (exit 1), and the script lists it.
+
+To deploy again before that, use another `SCL_PREFIX`. With a VPC COA created, the same prefix cannot be deployed until the teardown has finished: its network stack is still being deleted or in `DELETE_FAILED`, which CloudFormation cannot deploy over, so `make deploy-dev` stops in preflight and says when AWS releases the ENIs.
+
+Until a deferred teardown finishes, the VPC COA created still counts toward the VPCs-per-Region quota (default 5, see [Service Quotas](#service-quotas)). Each deploy under another prefix needs a VPC of its own, so a few deferred teardowns in a row, or one that is never run again, can make the preflight's VPC check stop the next deploy. The runtime security groups, AgentCore's ENIs (for up to 8 hours) and the `DELETE_FAILED` network stack count toward their quotas too (security groups, network interfaces and CloudFormation stacks per Region). Running the teardown again once AWS has released the ENIs, or the cleanup commands its summary prints, frees all of them. The first run already deletes the Elastic IP and the NAT gateway.
 
 Same environment-variable overrides as `make deploy-dev` — pass the same `SCL_PREFIX` and region you deployed with:
 
@@ -1056,11 +1189,16 @@ Additional destroy-specific variables:
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SCL_DESTROY_YES` | unset | Set to `1` to skip the interactive confirmation prompt (e.g. in CI). |
-| `SCL_ENI_WAIT_MAX_SECONDS` | `600` | Max wait for AgentCore ENI detach (step 2 — currently disabled). |
+| `SCL_ENI_WAIT_MAX_SECONDS` | `0` | Step 8: how long to wait for AWS to release the runtimes' ENIs before exiting 3. The wait starts once the NAT gateway and endpoints are deleted; `32400` (9 h) finishes in one run. |
+| `SCL_DESTROY_CONCURRENCY` | `4` | Stacks `cdk destroy` deletes in parallel, dependencies permitting. |
 | `SCL_ECS_WAIT_MAX_SECONDS` | `300` | Max wait for VKG ECS services to reach `INACTIVE`. |
+| `SCL_CLOUDMAP_WAIT_MAX_SECONDS` | `180` | Max wait for Cloud Map instances to deregister. |
 | `SCL_DOMAIN_WAIT_MAX_SECONDS` | `300` | Max wait for the DataZone domain to finish deleting. |
+| `SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS` | `1800` | Max wait for each connector stack to delete. |
 
-Steps 1-4 are idempotent — if the script exits early or a step warns and continues, re-running it later picks up from an already-deleted/in-progress state.
+Exit status of `scripts/destroy.sh`: `0` everything deleted, `3` only the network resources above left for a re-run, anything else a failure to inspect. `make destroy-dev` reports any non-zero status as make's own exit `2` (its message says `Error 3`), so call the script directly to tell a deferred teardown from a failed one.
+
+Every step is idempotent — if the script exits early or a step warns and continues, re-running it later picks up from an already-deleted/in-progress state.
 
 !!! warning
     This deletes all resources including databases and stored data. Neptune and OpenSearch data is not recoverable after deletion.
@@ -1080,7 +1218,7 @@ cd <repo-root>
 AWS_DEFAULT_REGION=<REGION> SCL_PREFIX=<PREFIX> ./scripts/destroy.sh <env>
 ```
 
-Or fall back to a plain `cdk destroy` (skips all the pre-cleanup steps above — expect the known failures documented in Troubleshooting):
+Or fall back to a plain `cdk destroy`. It skips all the steps above, and CDK stops at the first stack that fails to delete — expect the failures documented in Troubleshooting. It also leaves the retained AgentCore Runtime security groups behind: in a VPC COA created, the network stack then fails to delete the VPC; with an imported VPC (`SCL_VPC_ID`), the command succeeds and the groups stay in that VPC. Either way, `make destroy-dev` deletes them once AWS has released their ENIs:
 
 ```bash
 cd infra
@@ -1124,26 +1262,27 @@ aws sqs start-message-move-task --source-arn <sources-delete-dlq ARN>
 
 A source that reads `DELETE_FAILED` can instead be retried with another `DELETE`.
 
-### AgentCore ENI wait can take hours
+### AgentCore ENIs outlive the runtimes
 
-**Symptom:** the `*-mcp` and `*-serve` stacks fail to delete their security groups with `has a dependent object` (`DependencyViolation`), even after `make destroy-dev` deletes the AgentCore Runtimes.
+**Symptom:** `make destroy-dev` ends with "Teardown deferred: AWS still holds the AgentCore Runtimes' ENIs" and `Error 3` (`scripts/destroy.sh` exits 3, make itself 2). Or, with a plain `cdk destroy`, the network stack fails to delete its subnets and VPC (`has dependencies`); with an imported VPC (`SCL_VPC_ID`), it succeeds and leaves the runtime security groups in that VPC. On a deployment from before the runtime security groups were retained, the `*-mcp` or `*-serve` stack fails on its security group instead (`has a dependent object`) and CDK stops there.
 
-**Cause:** AgentCore Runtime provisions VPC network interfaces (ENIs) directly, outside CloudFormation. Runtime deletion doesn't synchronously release them — in practice this has been observed to take **several hours, and sometimes days**, not the few minutes originally expected. CloudFormation has no visibility into these ENIs and tries to delete the security group immediately, before they're gone.
+**Cause:** AgentCore Runtime provisions VPC network interfaces (ENIs) itself, outside CloudFormation, and shares them across runtimes that use the same subnets and security group. Deleting a runtime doesn't release them: "the associated ENI may persist in your VPC for up to 8 hours before it is automatically removed" (AgentCore VPC documentation); about 8 hours was measured on COA dev deployments. Until then they hold the runtime's security group, the private subnets and the VPC.
 
-**Fix:** there isn't a fast one. `make destroy-dev` already deletes the Runtimes as its first step to start the detach clock as early as possible, but you generally need to **wait and retry later** (a few hours to a day) rather than intervene:
+**Fix:** nothing to do now. `make destroy-dev` keeps the two runtime security groups out of their stacks' delete and deletes everything else, leaving the VPC, its subnets and the two security groups, which AWS does not charge for. Re-run it after the time the summary prints (up to 8 hours after the runtimes were deleted) to delete them, or run the commands it prints:
 
 ```bash
-# Re-run later — steps 1-4 are idempotent and safe to repeat.
-make destroy-dev
+make destroy-dev   # same SCL_PREFIX and region as the first run
 ```
 
-Do not attempt to manually detach or delete the ENIs yourself — they're AWS-managed and manual intervention doesn't speed up the release. If it's still stuck after a day or more, treat it as an AWS-side issue rather than something to fix locally.
+To deploy again in the meantime, use another `SCL_PREFIX`; with a VPC COA created, `make deploy-dev` refuses the same prefix until the teardown has finished.
+
+Do not try to detach or delete the `agentic_ai` ENIs yourself: AWS owns them and releases them on its own schedule. Detached Lambda ENIs (status `available`, description `AWS Lambda VPC ENI-<PREFIX>-dev-*`) are different; `make destroy-dev` deletes those itself.
 
 ### Why does namespace stack fail to delete with "domain not empty"?
 
 **Symptom:** the `*-namespace` stack fails to delete with `Domain cannot be deleted because there are existing projects under this domain`, or the `SystemProject`/`DefaultProjectProfile` resources fail with `failed to stabilize due to internal failure` or `deletion prevented by project ...`.
 
-**Cause:** every namespace creates its own DataZone project, and CloudFormation's native `DeleteDomain`/`DeleteProject` calls can't force past a shared asset type (`CoaRelationalTable`) that's still referenced by other projects' assets — which is always true while more than one namespace exists. `make destroy-dev` handles this automatically (step 4: `delete-domain --skip-deletion-check`, a true force-delete at the domain level). If you're running a bare `cdk destroy` instead of `make destroy-dev`, you'll hit this.
+**Cause:** every namespace creates its own DataZone project, and CloudFormation's native `DeleteDomain`/`DeleteProject` calls can't force past a shared asset type (`CoaRelationalTable`) that's still referenced by other projects' assets — which is always true while more than one namespace exists. `make destroy-dev` handles this automatically (step 5: `delete-domain --skip-deletion-check`, a true force-delete at the domain level). If you're running a bare `cdk destroy` instead of `make destroy-dev`, you'll hit this.
 
 **Fix:** use `make destroy-dev` instead of a raw `cdk destroy`. If you're already stuck on a bare `cdk destroy`, resolve the SMUS domain ID from SSM and force-delete it directly, then retry:
 
@@ -1289,6 +1428,7 @@ group most easily missed when scoping IAM permissions or regional availability.
 | **Amazon Redshift Data API** | Querying Redshift-backed sources | `packages/context-manager/.../clients/redshift_data.py` |
 | **AWS Secrets Manager** | Data-source credentials (e.g. JDBC) | `packages/sources`, `packages/context-manager` |
 | **AWS STS** | Role assumption and caller identity across services | Widely used (~10 modules) |
+| **OoPS! (third party, optional)** | Ontology pitfall scan in Tier-3 validation. Off unless `OOPS_ENDPOINT` is configured; when on, receives the serialised ontology | `packages/ontology-engine/.../validation/validators/tier3.py` |
 
 
 ### A.3 Quotas to check before deploying
@@ -1305,7 +1445,7 @@ own applied values with the commands that follow.
 
 | Service | Quota (code) | AWS default | Why it matters here |
 |---------|--------------|-------------|---------------------|
-| **VPC** | VPCs per Region (`L-F678F1CE`) | 5 | Deploy creates one VPC unless `SCL_VPC_ID` is set. Preflight-checked — see [Service Quotas](#service-quotas) |
+| **VPC** | VPCs per Region (`L-F678F1CE`) | 5 | A first deploy creates one VPC unless `SCL_VPC_ID` is set; updates reuse it. Preflight-checked — see [Service Quotas](#service-quotas) |
 | **Lambda** | Concurrent executions (`L-B99A9384`) | 1,000 (10 on some new accounts) | Two functions reserve concurrency (default 5 each). Preflight-checked — see [Lambda reserved concurrency](#lambda-reserved-concurrency) |
 | **ECS / Fargate** | Fargate On-Demand vCPU resource count (`L-3032A538`) | **6** | **The tightest fit here.** Tasks are 2 vCPU / 8 GB and 4 vCPU / 16 GB, and VKG runs one service **per namespace** — so a single enrichment task plus two namespaces' VKG services can exhaust the default |
 | **OpenSearch Serverless** | Indexing max OCU (`L-50FA809B`), search max OCU (`L-4E98D4EB`) | 10 each | The collection runs with standby replicas enabled, which roughly doubles OCU consumption — see [A.4](#a4-considerations) |
@@ -1315,12 +1455,12 @@ own applied values with the commands that follow.
 | **Amazon Textract** | `DetectDocumentText` TPS (`L-75788A8B`) | 25 | Only relevant if ingesting scanned documents at volume |
 
 Quotas that are **not** worth checking, having confirmed the headroom: the deploy
-creates 16 CloudFormation stacks against a default of 2,000 (`L-0485CB21`), about
+creates 17 CloudFormation stacks plus the connector's against a default of 2,000 (`L-0485CB21`), about
 11 S3 buckets against a far higher bucket limit, and consumes ENIs against a
 default of 5,000 per Region (`L-DF5E4CA3`). A single NAT gateway
 (`natGateways: 1`, `maxAzs: 2`) means one Elastic IP. AgentCore's slow ENI
 release after teardown is a real problem, but it is a *timing* issue rather than a
-quota one — see [AgentCore ENI wait](#agentcore-eni-wait-can-take-hours).
+quota one — see [AgentCore ENIs outlive the runtimes](#agentcore-enis-outlive-the-runtimes).
 
 Check a specific quota's default and your account's applied value with:
 
@@ -1370,14 +1510,9 @@ rest, and 7-day backups. Deletion protection is enabled **only** when
 availability guarantee from a second instance, and the cluster is deletable — so
 `make destroy-dev` will remove the graph and its data irreversibly.
 
-**Neptune and OpenSearch dominate deploy time.** They, plus AgentCore Runtime
-setup and cross-stack SSM waits, are why a fresh deploy takes ~1.5 hours. A
-deploy that looks stuck is usually waiting on one of them — check
-`aws cloudformation list-stacks` before intervening.
-
 **Teardown is not symmetric with deploy.** AgentCore Runtime provisions ENIs
-outside CloudFormation and can hold them for hours to days after runtime
-deletion, blocking security-group deletion. VKG creates ECS services outside
+outside CloudFormation and holds them for up to 8 hours after runtime
+deletion, blocking deletion of the VPC that contains them. VKG creates ECS services outside
 CloudFormation (one per namespace), and DataZone domains need a force-delete.
 `make destroy-dev` handles all three; a bare `cdk destroy` does not. Budget for
 teardown taking longer than deploy, and see [Tearing Down](#tearing-down).

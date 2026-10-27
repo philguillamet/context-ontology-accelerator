@@ -27,24 +27,32 @@ The Playground streams responses in real-time via SSE (Server-Sent Events), show
 ### REST API
 
 `POST /namespaces/{namespaceId}/query` with a natural-language `query` and
-optional `options` — see **Query** in the [API Reference](#/api-reference)
-for the full request/response schema.
+optional members alongside it in the same JSON body (top-level fields, not
+nested under an `options` object) — see **Query** in the
+[API Reference](#/api-reference) for the full request/response schema. A member
+with the wrong type or outside its documented range is rejected with `400`
+rather than clamped or ignored.
 
 Options:
 - `execute: false` — return the generated SQL without executing it
-- `tierOverride` — force a specific resolution tier (1, 2, or 3)
+- `tierOverride` — force a specific resolution tier (integer 1–3)
 - `mode` — choose the execution policy: the Standard tier cascade or Deep
   Reasoning (see below)
 - `strategy` — choose which Tier-2 engine answers a structured query (see below)
-- `maxResults` — limit result rows
+- `maxResults` — limit result rows (1–10000)
 - `includeSupporting` — include supporting context in the response
 - `includeDebugInfo` — include the generated `queryUsed` (SQL) and
   `sparqlGenerated` fields in the response. **Off by default.** ⚠️ Security:
-  these fields expose internal schema (table and column names, joins). Only
-  enable for trusted callers or development environments.
-- `timeoutMs` — cap the server-side resolution budget for this request. Only ever
-  *lowers* the budget below the transport ceiling (a value above the ceiling is
-  clamped); non-positive/invalid values are ignored.
+  these fields expose internal schema (table and column names, joins), so the
+  flag is honoured only for a platform admin or a namespace owner, maintainer
+  or data steward of the queried namespace. For any other caller the query
+  still succeeds, with both fields omitted.
+- `dimensions` — dimension filters, a list of up to 100 `{name, value}`
+  objects (`name` 1–256 characters and unique case-insensitively, `value` up
+  to 4000 characters, `operator` only `=`)
+- `timeoutMs` — cap the server-side resolution budget for this request, an
+  integer from 1 to 29000 (the REST ceiling). It can only *lower* the budget;
+  a value outside that range is rejected with `400`.
 
 > **⚠️ REST has a hard 29-second timeout.** The REST endpoint runs behind API
 > Gateway, whose integration timeout is a fixed **29 s** (`timeoutInMillis: 29000`)
@@ -413,6 +421,8 @@ covered as well as those that do:
 2. **SQL Firewall (Tier 1/2 only)** — for queries that execute SQL, the firewall
    validates the statement and enforces per-user table allowlists and column
    denylists, then applies the Cedar namespace policy again as a final gate.
+   The same table allowlist filters the table names listed in the query trace
+   and response metadata, so a caller never sees tables outside their grant.
 3. **Metric allowlist** — restricts which metrics a user can resolve (if configured).
 
 The admission gate is what protects the paths that produce no SQL — Tier 3 document
@@ -450,7 +460,17 @@ indexed document. `sourceDocumentName` is the human-readable original file
 name for display. Names are not unique: two document sources can contain a file
 with the same name while returning different `sourceDocumentId` values.
 
-`DescribeSchema` returns the classes and properties currently loaded into the namespace's ontologies, so a caller can find the entities available before writing a query. Optional query params: `includeProperties` (default `true`) to include class properties, and `maxResults` to cap the class count. The same schema is what the MCP `describe_schema` tool exposes — REST and MCP read from one source.
+`KBSearch` accepts `topK` (1–100, default 10) and `minScore`. `sourceFilter`
+and `entityFilter` are not supported yet: a non-empty value is rejected with
+`400` rather than returning unfiltered chunks.
+
+`GraphTraverse` requires `startUri`, an absolute `http(s)` IRI or a `urn:` name
+of at most 2048 characters. `maxDepth` (1–5, default 2; depths above 2 currently
+traverse 2 hops) and `maxResults` (1–1000 entities, default 100) are applied.
+`direction` and `relationshipFilter` are validated but not yet applied:
+traversal currently follows every relationship in both directions.
+
+`DescribeSchema` returns the classes and properties currently loaded into the namespace's ontologies, so a caller can find the entities available before writing a query. Optional query params: `includeProperties` (default `true`) to include class properties, and `maxResults` (1–1000) to cap the class count. The same schema is what the MCP `describe_schema` tool exposes — REST and MCP read from one source.
 
 See these operations in the [API Reference](#/api-reference) for their full request/response schemas.
 

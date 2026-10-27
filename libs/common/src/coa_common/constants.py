@@ -392,16 +392,14 @@ def validate_id(value: str, name: str) -> None:
     """
     if not value or not SAFE_ID_RE.match(value):
         raise ValueError(
-            f"Invalid {name}: {value!r}. "
-            "Must be non-empty and contain only alphanumeric characters, "
-            "hyphens, or underscores."
+            f"Invalid {name}. Must be non-empty and contain only alphanumeric characters, hyphens, or underscores."
         )
 
 
 def validate_namespace_id(value: str, name: str = "namespaceId") -> None:
     """Raise ``ValueError`` if *value* is not a valid UUID v4 namespace ID."""
     if not value or not NAMESPACE_ID_RE.match(value):
-        raise ValueError(f"Invalid {name}: {value!r}. Must be a UUID v4 (e.g. '550e8400-e29b-41d4-a716-446655440000').")
+        raise ValueError(f"Invalid {name}. Must be a UUID v4 (e.g. '550e8400-e29b-41d4-a716-446655440000').")
 
 
 def validate_source_id(value: str, name: str = "sourceId") -> None:
@@ -431,7 +429,7 @@ def validate_namespace_name(value: str) -> None:
     Used for safe interpolation in SPARQL graph URIs and OpenSearch index names.
     """
     if not NAMESPACE_NAME_RE.match(value):
-        raise ValueError(f"Invalid namespace {value!r}: must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{{0,127}}$")
+        raise ValueError("Invalid namespace: must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 
 def validate_s3_prefix(value: str, name: str) -> None:
@@ -444,7 +442,62 @@ def validate_s3_prefix(value: str, name: str) -> None:
     if not value:
         return
     if value.startswith("/") or ".." in value or value.startswith("s3://") or not SAFE_S3_PREFIX_RE.match(value):
-        raise ValueError(f"Invalid {name}: {value!r}. Must be a relative path like 'healthcare/' or 'documents/2024/'.")
+        raise ValueError(f"Invalid {name}. Must be a relative path like 'healthcare/' or 'documents/2024/'.")
+
+
+# Grant principal IDs: emails, IdP ``sub`` UUIDs, group names, agent IDs.
+# IdP group names and emails are free-form (``R&D Team``, ``Sales (EMEA)``,
+# non-ASCII letters, ``o'brien@...``), so instead of an allowlist this rejects
+# the characters that carry markup or escape a quoted context (``<`` ``>``
+# ``"`` backtick ``\``), control characters, and the grant key / grant-id
+# delimiters ``#`` and ``|``. ``::`` is rejected separately because a single
+# ``:`` is legitimate. Keep in sync with ``PrincipalId`` in
+# models/src/main/smithy/grant.smithy.
+PRINCIPAL_ID_RE: re.Pattern[str] = re.compile(r'[^<>"`\\#|\x00-\x1F\x7F]{1,256}')
+
+# Ontology URI prefix: http(s), an RFC 1123 host, an optional port 1-65535, and
+# an optional path of non-empty segments (no ``.``/``..``) made of RFC 3986
+# unreserved characters or ``%HH`` escapes, ending in an optional ``/`` and/or
+# ``#``. Escapes are stored as-is and never decoded. Keep in sync with
+# ``OntologyUriPrefix`` in models/src/main/smithy/ontology-induction.smithy.
+ONTOLOGY_URI_PREFIX_RE: re.Pattern[str] = re.compile(
+    r"https?://[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*"
+    r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5][0-9]{4}|[1-9][0-9]{0,3}))?"
+    r"(?:/(?!\.\.?(?:[/#]|$))(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+)*/?#?"
+)
+MAX_ONTOLOGY_URI_PREFIX_LEN = 2048
+
+
+def validate_principal_id(value: object, name: str = "principalId") -> str:
+    """Return *value* if it is a well-formed grant principal ID, else raise ``ValueError``.
+
+    The raw value is deliberately not echoed in the error: principal IDs are
+    caller-supplied and the message is returned in the API response.
+    """
+    if not isinstance(value, str) or not PRINCIPAL_ID_RE.fullmatch(value) or "::" in value:
+        raise ValueError(
+            f"Invalid {name}: must be 1-256 characters and may not contain <, >, \", `, \\, #, |, '::', "
+            "or control characters."
+        )
+    return value
+
+
+def validate_ontology_uri_prefix(value: object, name: str = "ontology_uri_prefix") -> str:
+    """Return the stripped *value* if it is a safe http(s) IRI prefix, else raise ``ValueError``.
+
+    The prefix is minted into every induced class/property IRI and stored as the
+    ontology ID, so it must not carry markup, quotes, whitespace, query strings,
+    or userinfo.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid {name}: must be a string.")
+    value = value.strip()
+    if len(value) > MAX_ONTOLOGY_URI_PREFIX_LEN or not ONTOLOGY_URI_PREFIX_RE.fullmatch(value):
+        raise ValueError(
+            f"Invalid {name}: must be an http(s) URI such as 'https://example.com/ontology/sales#' "
+            "with a valid host and port and a path of letters, digits, ._~- or %HH escapes."
+        )
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +545,7 @@ def to_graphrag_tenant_id(namespace_id: str, doc_source_id: str = "") -> str:
         return ""
     stripped = namespace_id.replace("-", "")
     if not _TENANT_ID_HEX_RE.match(stripped):
-        raise ValueError(f"namespace_id must be a hex UUID after hyphen stripping; got {namespace_id!r}")
+        raise ValueError("namespace_id must be a hex UUID after hyphen stripping")
     return stripped[:25]
 
 
@@ -684,7 +737,7 @@ def ontology_artifact_s3_key(namespace: str, version: str, filename: str) -> str
     validate_id(version, "version")
     validate_id(filename.replace(".", ""), "filename")
     if ".." in filename or "/" in filename:
-        raise ValueError(f"Invalid filename: {filename!r}. Must not contain path traversal characters.")
+        raise ValueError("Invalid filename. Must not contain path traversal characters.")
     return f"{ONTOLOGY_ARTIFACTS_PREFIX}/{namespace}/{version}/{filename}"
 
 
@@ -694,6 +747,9 @@ def ontology_artifact_s3_key(namespace: str, version: str, filename: str) -> str
 
 DEFAULT_PAGE_SIZE: int = 25
 MAX_PAGE_SIZE: int = 100
+# common.smithy PaginationToken @length(max: 8192): the longest nextToken a
+# list operation accepts.
+PAGINATION_TOKEN_MAX_LENGTH: int = 8192
 
 
 # ---------------------------------------------------------------------------

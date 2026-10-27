@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React from "react";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { LocaleProvider } from "../i18n/LocaleProvider";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import path from "node:path";
@@ -117,25 +118,30 @@ vi.mock("@utils/helpers", () => ({
 // Wrapper
 // ---------------------------------------------------------------------------
 
+// LocaleProvider sits at the app root in production and supplies the wizard's
+// and file upload's built-in strings ("Next", "Choose file", …) that the page
+// no longer hand-writes.
 const wrapper = ({ children }: { children: React.ReactNode }) => (
-  <QueryClientProvider client={new QueryClient()}>
-    <MemoryRouter initialEntries={[`/namespaces/${NS_ID}/sources/connect`]}>
-      <Routes>
-        <Route
-          path="/namespaces/:namespaceId/sources/connect"
-          element={children}
-        />
-        <Route
-          path="/namespaces/:namespaceId/sources/:sourceId"
-          element={<div>SOURCE_DETAIL</div>}
-        />
-        <Route
-          path="/namespaces/:namespaceId/sources"
-          element={<div>SOURCE_LIST</div>}
-        />
-      </Routes>
-    </MemoryRouter>
-  </QueryClientProvider>
+  <LocaleProvider>
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={[`/namespaces/${NS_ID}/sources/connect`]}>
+        <Routes>
+          <Route
+            path="/namespaces/:namespaceId/sources/connect"
+            element={children}
+          />
+          <Route
+            path="/namespaces/:namespaceId/sources/:sourceId"
+            element={<div>SOURCE_DETAIL</div>}
+          />
+          <Route
+            path="/namespaces/:namespaceId/sources"
+            element={<div>SOURCE_LIST</div>}
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
+  </LocaleProvider>
 );
 
 // ---------------------------------------------------------------------------
@@ -448,8 +454,8 @@ describe("ConnectSource — advanced configuration", () => {
     // Expand advanced and fill exclude filter
     await user.click(screen.getByText("Advanced configuration"));
     await user.type(
-      screen.getByPlaceholderText("tmp_.*|staging_.*"),
-      "tmp_.*|backup_.*",
+      screen.getByPlaceholderText("tmp_*|staging_*"),
+      "tmp_*|backup_*",
     );
 
     await clickNext(); // → enrichment
@@ -459,7 +465,7 @@ describe("ConnectSource — advanced configuration", () => {
     expect(mockCreate).toHaveBeenCalledTimes(1);
     const cfg =
       mockCreate.mock.calls[0][0].body.databaseSource.glueConfiguration;
-    expect(cfg.tableExcludeFilter).toBe("tmp_.*|backup_.*");
+    expect(cfg.tableExcludeFilter).toBe("tmp_*|backup_*");
   });
 
   it("does not offer engines withheld from the product", async () => {
@@ -1535,5 +1541,37 @@ describe("ConnectSource — External ID unavailable state", () => {
 
     expect(screen.getByText("Loading…")).toBeInTheDocument();
     expect(screen.queryByText(/Unavailable/)).toBeNull();
+  });
+});
+
+describe("ConnectSource — Japanese document configuration", () => {
+  beforeEach(() => {
+    window.localStorage.setItem("scl.locale", "ja");
+  });
+
+  afterEach(() => {
+    window.localStorage.clear();
+    document.documentElement.lang = "";
+  });
+
+  it("localizes the entity classes and topics section", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("データソースの種類を選択").length,
+      ).toBeGreaterThan(0);
+    });
+    await user.click(screen.getByLabelText("文書"));
+    await user.click(screen.getByRole("button", { name: "次へ" }));
+
+    expect(
+      await screen.findByText("エンティティクラスとトピック（任意）"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("エンティティクラス")).toBeInTheDocument();
+    expect(screen.getByText("トピック")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Entity classes and topics (optional)"),
+    ).not.toBeInTheDocument();
   });
 });

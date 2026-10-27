@@ -45,7 +45,7 @@ def _dispatch(body: WorkbenchInductionRequest):
     UnstructuredInductionRequest it was called with."""
     with (
         patch.object(induce_catalog, "dynamo_store", autospec=True),
-        patch("coa_ontology.inducer.routers.induce_unstructured.start_induction") as mock_unstructured,
+        patch("coa_ontology.inducer.routers.induce_unstructured.start_unstructured_job") as mock_unstructured,
     ):
         mock_unstructured.return_value = SimpleNamespace(job_id="j", status="pending")
         # graph_arn must satisfy UnstructuredInductionRequest's SSRF-guard
@@ -131,6 +131,15 @@ class TestWorkbenchRequestGroundingAliases:
         )
         assert b.grounding_mode == "STANDARD"
         assert b.grounding_ontology_ids == ["b"]
+
+    def test_graph_arn_camel_case_binds(self):
+        b = WorkbenchInductionRequest.model_validate(
+            {
+                "ontology_uri_prefix": "http://x/o#",
+                "graphArn": "arn:aws:neptune-graph:us-east-1:123456789012:graph/g-test",
+            }
+        )
+        assert b.graph_arn == "arn:aws:neptune-graph:us-east-1:123456789012:graph/g-test"
 
     def test_default_when_omitted(self):
         b = WorkbenchInductionRequest(ontology_uri_prefix="http://x/o#")

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from hashlib import sha1
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
@@ -53,7 +53,7 @@ def _chunk_key(chunk: Any) -> str:
     if uri:
         return f"chunk:{uri}"
     text = getattr(chunk, "text", "") or ""
-    return f"chunk:#{sha1(text.encode('utf-8')).hexdigest()}"
+    return f"chunk:#{sha256(text.encode('utf-8')).hexdigest()}"
 
 
 def _entity_key(entity: Any) -> str:
@@ -79,7 +79,7 @@ def _row_key(row: dict) -> str:
     back to ``repr`` via ``default=str`` so the key derivation never raises.
     """
     canonical = json.dumps(row, sort_keys=True, default=str)
-    return f"row:#{sha1(canonical.encode('utf-8')).hexdigest()}"
+    return f"row:#{sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 # Caps so the carried reasoning state can never blow the planner prompt.
@@ -148,6 +148,11 @@ class AccumulatedContext:
     # planner can propose for an ``edge_typed`` traversal even when the pruned
     # ontology omits them. Insertion order preserved (discovery is frequency-ranked).
     present_edge_types: list[str] = field(default_factory=list)
+    # BCP 47 tag of the user's question, resolved ONCE at session start and read by
+    # every step that writes prose (the planner's working answer and the final
+    # synthesis), so no step has to guess the language again. Empty means
+    # unresolved: those steps fall back to "match the question's language".
+    answer_language: str = ""
 
     def add(self, result: ToolResult) -> int:
         """Incorporate a ToolResult's chunks/entities/rows, returning the NEW count.
@@ -212,7 +217,11 @@ class AccumulatedContext:
         retrievals, not a sibling's). Results are folded back with :meth:`merge`
         after the sibling loops join.
         """
-        return AccumulatedContext(ontology=self.ontology, present_edge_types=list(self.present_edge_types))
+        return AccumulatedContext(
+            ontology=self.ontology,
+            present_edge_types=list(self.present_edge_types),
+            answer_language=self.answer_language,
+        )
 
     def merge(self, other: AccumulatedContext) -> int:
         """Fold a forked sub-context back into this one, returning the NEW count (P2).
